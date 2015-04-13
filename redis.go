@@ -17,7 +17,6 @@ func (c *baseClient) writeCmd(cn *conn, cmds ...Cmder) error {
 	for _, cmd := range cmds {
 		buf = appendArgs(buf, cmd.args())
 	}
-
 	_, err := cn.Write(buf)
 	return err
 }
@@ -99,8 +98,9 @@ func (c *baseClient) Process(cmd Cmder) {
 	}
 }
 
-func (c *baseClient) run(cmd Cmder) {
+func (c *baseClient) runWithoutRetry(cmd Cmder) {
 	cn, err := c.conn()
+
 	if err != nil {
 		cmd.setErr(err)
 		return
@@ -120,16 +120,31 @@ func (c *baseClient) run(cmd Cmder) {
 
 	if err := c.writeCmd(cn, cmd); err != nil {
 		c.freeConn(cn, err)
-		cmd.setErr(err)
+		panic(err)
+		//		cmd.setErr(err)
 		return
 	}
 
-	if err := cmd.parseReply(cn.rd); err != nil {
+	err = cmd.parseReply(cn.rd)
+
+	if err != nil {
 		c.freeConn(cn, err)
 		return
 	}
 
 	c.putConn(cn)
+}
+
+func (c *baseClient) run(cmd Cmder) {
+	defer func() {
+		if err := recover(); err != nil {
+			if _, ok := err.(redisError); !ok {
+				c.runWithoutRetry(cmd)
+			}
+
+		}
+	}()
+	c.runWithoutRetry(cmd)
 }
 
 // Close closes the client, releasing any open resources.

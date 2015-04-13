@@ -112,12 +112,14 @@ func parseReq(rd *bufio.Reader) ([]string, error) {
 func parseReply(rd *bufio.Reader, p multiBulkParser) (interface{}, error) {
 	line, err := readLine(rd)
 	if err != nil {
-		return nil, err
+		panic(err)
+		//		return nil, err
 	}
 
 	switch line[0] {
 	case '-':
-		return nil, errorf(string(line[1:]))
+		panic(string(line[1:]))
+		//		return nil, errorf(string(line[1:]))
 	case '+':
 		return string(line[1:]), nil
 	case ':':
@@ -138,7 +140,8 @@ func parseReply(rd *bufio.Reader, p multiBulkParser) (interface{}, error) {
 
 		b, err := readN(rd, replyLen+2)
 		if err != nil {
-			return nil, err
+			panic(err)
+			// return nil, err
 		}
 		return string(b[:replyLen]), nil
 	case '*':

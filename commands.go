@@ -1,6 +1,7 @@
 package redis
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 )
@@ -428,6 +429,12 @@ func (c *Client) Set(key, value string) *StatusCmd {
 	return cmd
 }
 
+func (c *Client) SetExNx(key string, dur time.Duration, value int64) *StatusCmd {
+	cmd := NewStatusCmd("SET", key, strconv.FormatInt(value, 10), "EX", strconv.FormatInt(int64(dur/time.Second), 10), "NX")
+	c.Process(cmd)
+	return cmd
+}
+
 func (c *Client) SetBit(key string, offset int64, value int) *IntCmd {
 	cmd := NewIntCmd(
 		"SETBIT",
@@ -443,6 +450,10 @@ func (c *Client) SetEx(key string, dur time.Duration, value string) *StatusCmd {
 	cmd := NewStatusCmd("SETEX", key, strconv.FormatInt(int64(dur/time.Second), 10), value)
 	c.Process(cmd)
 	return cmd
+}
+
+func (c *Client) SetExInt(key string, dur time.Duration, value int64) *StatusCmd {
+	return c.SetEx(key, dur, strconv.FormatInt(value, 10))
 }
 
 func (c *Client) SetNX(key, value string) *BoolCmd {
@@ -484,6 +495,10 @@ func (c *Client) HGet(key, field string) *StringCmd {
 	return cmd
 }
 
+func (c *Client) HGetByInt(key string, field int) *StringCmd {
+	return c.HGet(key, strconv.Itoa(field))
+}
+
 func (c *Client) HGetAll(key string) *StringSliceCmd {
 	cmd := NewStringSliceCmd("HGETALL", key)
 	c.Process(cmd)
@@ -498,6 +513,12 @@ func (c *Client) HGetAllMap(key string) *StringStringMapCmd {
 
 func (c *Client) HIncrBy(key, field string, incr int64) *IntCmd {
 	cmd := NewIntCmd("HINCRBY", key, field, strconv.FormatInt(incr, 10))
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *Client) HIncr(key string, field int64, incr int64) *IntCmd {
+	cmd := NewIntCmd("HINCRBY", key, strconv.FormatInt(field, 10), strconv.FormatInt(incr, 10))
 	c.Process(cmd)
 	return cmd
 }
@@ -527,8 +548,11 @@ func (c *Client) HMGet(key string, fields ...string) *SliceCmd {
 	return cmd
 }
 
-func (c *Client) HMSet(key, field, value string, pairs ...string) *StatusCmd {
-	args := append([]string{"HMSET", key, field, value}, pairs...)
+func (c *Client) HMSet(key string, pairs ...string) *StatusCmd {
+	if len(pairs) < 2 || len(pairs)%2 != 0 {
+		panic("Invalid arguments")
+	}
+	args := append([]string{"HMSET", key}, pairs...)
 	cmd := NewStatusCmd(args...)
 	c.Process(cmd)
 	return cmd
@@ -558,7 +582,7 @@ func (c *Client) BLPop(timeout int64, keys ...string) *StringSliceCmd {
 	args := append([]string{"BLPOP"}, keys...)
 	args = append(args, strconv.FormatInt(timeout, 10))
 	cmd := NewStringSliceCmd(args...)
-	cmd.setReadTimeout(readTimeout(timeout))
+	//	cmd.setReadTimeout(readTimeout(timeout))
 	c.Process(cmd)
 	return cmd
 }
@@ -689,6 +713,14 @@ func (c *Client) SAdd(key string, members ...string) *IntCmd {
 	return cmd
 }
 
+func (c *Client) SAddI64(key string, members ...int64) *IntCmd {
+	strMembers := make([]string, 0, len(members))
+	for _, member := range members {
+		strMembers = append(strMembers, strconv.FormatInt(member, 10))
+	}
+	return c.SAdd(key, strMembers...)
+}
+
 func (c *Client) SCard(key string) *IntCmd {
 	cmd := NewIntCmd("SCARD", key)
 	c.Process(cmd)
@@ -812,6 +844,10 @@ func (c *Client) ZIncrBy(key string, increment float64, member string) *FloatCmd
 	cmd := NewFloatCmd("ZINCRBY", key, formatFloat(increment), member)
 	c.Process(cmd)
 	return cmd
+}
+
+func (c *Client) ZIncrByInt64(key string, increment int64, member int64) *FloatCmd {
+	return c.ZIncrBy(key, float64(increment), strconv.FormatInt(member, 10))
 }
 
 func (c *Client) ZInterStore(
@@ -952,6 +988,10 @@ func (c *Client) zRevRange(key, start, stop string, withScores bool) *StringSlic
 
 func (c *Client) ZRevRange(key, start, stop string) *StringSliceCmd {
 	return c.zRevRange(key, start, stop, false)
+}
+
+func (c *Client) ZRevRangeWithScoresByInt(key string, start, stop int64) *ZSliceCmd {
+	return c.ZRevRangeWithScores(key, fmt.Sprintf("%d", start), fmt.Sprintf("%d", stop))
 }
 
 func (c *Client) ZRevRangeWithScores(key, start, stop string) *ZSliceCmd {
