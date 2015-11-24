@@ -524,7 +524,17 @@ func (c *commandable) MSetNX(pairs ...string) *BoolCmd {
 // Redis `SET key value [expiration]` command.
 //
 // Zero expiration means the key has no expiration time.
-func (c *commandable) Set(key string, value interface{}, expiration time.Duration) *StatusCmd {
+func (c *commandable) Set(key string, value interface{}) *StatusCmd {
+	args := make([]interface{}, 3, 5)
+	args[0] = "SET"
+	args[1] = key
+	args[2] = value
+	cmd := NewStatusCmd(args...)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) SetEx(key string, value interface{}, expiration time.Duration) *StatusCmd {
 	args := make([]interface{}, 3, 5)
 	args[0] = "SET"
 	args[1] = key
@@ -569,6 +579,10 @@ func (c *commandable) SetNX(key string, value interface{}, expiration time.Durat
 	}
 	c.Process(cmd)
 	return cmd
+}
+
+func (c *commandable) SetExNx(key string, value interface{}, expiration time.Duration) *BoolCmd {
+	return c.SetNX(key, value, expiration)
 }
 
 // Redis `SET key value [expiration] XX` command.
@@ -623,6 +637,10 @@ func (c *commandable) HGet(key, field string) *StringCmd {
 	return cmd
 }
 
+func (c *Client) HGetByInt(key string, field int) *StringCmd {
+	return c.HGet(key, strconv.Itoa(field))
+}
+
 func (c *commandable) HGetAll(key string) *StringSliceCmd {
 	cmd := NewStringSliceCmd("HGETALL", key)
 	c.Process(cmd)
@@ -631,6 +649,12 @@ func (c *commandable) HGetAll(key string) *StringSliceCmd {
 
 func (c *commandable) HGetAllMap(key string) *StringStringMapCmd {
 	cmd := NewStringStringMapCmd("HGETALL", key)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *Client) HIncr(key string, field int64, incr int64) *IntCmd {
+	cmd := NewIntCmd("HINCRBY", key, field, incr)
 	c.Process(cmd)
 	return cmd
 }
@@ -861,6 +885,14 @@ func (c *commandable) SAdd(key string, members ...string) *IntCmd {
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
+}
+
+func (c *Client) SAddI64(key string, members ...int64) *IntCmd {
+	strMembers := make([]string, 0, len(members))
+	for _, member := range members {
+		strMembers = append(strMembers, strconv.FormatInt(member, 10))
+	}
+	return c.SAdd(key, strMembers...)
 }
 
 func (c *commandable) SCard(key string) *IntCmd {
@@ -1111,6 +1143,10 @@ func (c *commandable) ZIncrBy(key string, increment float64, member string) *Flo
 	cmd := NewFloatCmd("ZINCRBY", key, increment, member)
 	c.Process(cmd)
 	return cmd
+}
+
+func (c *Client) ZIncrByInt64(key string, increment int64, member int64) *FloatCmd {
+	return c.ZIncrBy(key, float64(increment), strconv.FormatInt(member, 10))
 }
 
 func (c *commandable) ZInterStore(

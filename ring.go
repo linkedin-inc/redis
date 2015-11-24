@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/redis.v3/internal/consistenthash"
+	"github.com/linkedin-inc/redis/internal/consistenthash"
 )
 
 var (
@@ -188,7 +188,7 @@ func (ring *Ring) rebalance() {
 func (ring *Ring) heartbeat() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	for _ = range ticker.C {
+	for range ticker.C {
 		var rebalance bool
 
 		ring.mx.RLock()
