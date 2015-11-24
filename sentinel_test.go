@@ -1,173 +1,74 @@
 package redis_test
 
 import (
-	"io/ioutil"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"testing"
-	"text/template"
-	"time"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
 
-	"gopkg.in/redis.v2"
+	"gopkg.in/redis.v3"
 )
 
-func startRedis(port string) (*exec.Cmd, error) {
-	cmd := exec.Command("redis-server", "--port", port)
-	if false {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return cmd, nil
-}
+var _ = Describe("Sentinel", func() {
+	var client *redis.Client
 
-func startRedisSlave(port, slave string) (*exec.Cmd, error) {
-	cmd := exec.Command("redis-server", "--port", port, "--slaveof", "127.0.0.1", slave)
-	if false {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return cmd, nil
-}
-
-func startRedisSentinel(port, masterName, masterPort string) (*exec.Cmd, error) {
-	dir, err := ioutil.TempDir("", "sentinel")
-	if err != nil {
-		return nil, err
-	}
-
-	sentinelConfFilepath := filepath.Join(dir, "sentinel.conf")
-	tpl, err := template.New("sentinel.conf").Parse(sentinelConf)
-	if err != nil {
-		return nil, err
-	}
-
-	data := struct {
-		Port       string
-		MasterName string
-		MasterPort string
-	}{
-		Port:       port,
-		MasterName: masterName,
-		MasterPort: masterPort,
-	}
-	if err := writeTemplateToFile(sentinelConfFilepath, tpl, data); err != nil {
-		return nil, err
-	}
-
-	cmd := exec.Command("redis-server", sentinelConfFilepath, "--sentinel")
-	if true {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	return cmd, nil
-}
-
-func writeTemplateToFile(path string, t *template.Template, data interface{}) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return t.Execute(f, data)
-}
-
-func TestSentinel(t *testing.T) {
-	masterName := "mymaster"
-	masterPort := "8123"
-	slavePort := "8124"
-	sentinelPort := "8125"
-
-	_, err := startRedis(masterPort)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(200 * time.Millisecond)
-
-	master := redis.NewTCPClient(&redis.Options{
-		Addr: ":" + masterPort,
-	})
-	if err := master.Ping().Err(); err != nil {
-		t.Fatal(err)
-	}
-	defer master.Shutdown()
-
-	_, err = startRedisSlave(slavePort, masterPort)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(200 * time.Millisecond)
-
-	slave := redis.NewTCPClient(&redis.Options{
-		Addr: ":" + slavePort,
-	})
-	if err := slave.Ping().Err(); err != nil {
-		t.Fatal(err)
-	}
-	defer slave.Shutdown()
-
-	_, err = startRedisSentinel(sentinelPort, masterName, masterPort)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(200 * time.Millisecond)
-
-	sentinel := redis.NewTCPClient(&redis.Options{
-		Addr: ":" + sentinelPort,
-	})
-	if err := sentinel.Ping().Err(); err != nil {
-		t.Fatal(err)
-	}
-	defer sentinel.Shutdown()
-
-	client := redis.NewFailoverClient(&redis.FailoverOptions{
-		MasterName:    masterName,
-		SentinelAddrs: []string{":" + sentinelPort},
+	BeforeEach(func() {
+		client = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    sentinelName,
+			SentinelAddrs: []string{":" + sentinelPort},
+		})
 	})
 
-	if err := client.Set("foo", "master").Err(); err != nil {
-		t.Fatal(err)
-	}
+	AfterEach(func() {
+		Expect(client.Close()).NotTo(HaveOccurred())
+	})
 
-	val, err := master.Get("foo").Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if val != "master" {
-		t.Fatalf(`got %q, expected "master"`, val)
-	}
+	It("should facilitate failover", func() {
+		// Set value on master, verify
+		err := client.Set("foo", "master", 0).Err()
+		Expect(err).NotTo(HaveOccurred())
 
-	// Kill master.
-	master.Shutdown()
+		val, err := sentinelMaster.Get("foo").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(val).To(Equal("master"))
 
-	// Wait for Redis sentinel to elect new master.
-	time.Sleep(5 * time.Second)
+		// Wait until replicated
+		Eventually(func() string {
+			return sentinelSlave1.Get("foo").Val()
+		}, "1s", "100ms").Should(Equal("master"))
+		Eventually(func() string {
+			return sentinelSlave2.Get("foo").Val()
+		}, "1s", "100ms").Should(Equal("master"))
 
-	// Check that client picked up new master.
-	val, err = client.Get("foo").Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if val != "master" {
-		t.Fatalf(`got %q, expected "master"`, val)
-	}
-}
+		// Wait until slaves are picked up by sentinel.
+		Eventually(func() string {
+			return sentinel.Info().Val()
+		}, "10s", "100ms").Should(ContainSubstring("slaves=2"))
 
-var sentinelConf = `
-port {{ .Port }}
+		// Kill master.
+		sentinelMaster.Shutdown()
+		Eventually(func() error {
+			return sentinelMaster.Ping().Err()
+		}, "5s", "100ms").Should(HaveOccurred())
 
-sentinel monitor {{ .MasterName }} 127.0.0.1 {{ .MasterPort }} 1
-sentinel down-after-milliseconds {{ .MasterName }} 1000
-sentinel failover-timeout {{ .MasterName }} 2000
-sentinel parallel-syncs {{ .MasterName }} 1
-`
+		// Wait for Redis sentinel to elect new master.
+		Eventually(func() string {
+			return sentinelSlave1.Info().Val() + sentinelSlave2.Info().Val()
+		}, "30s", "1s").Should(ContainSubstring("role:master"))
+
+		// Check that client picked up new master.
+		Eventually(func() error {
+			return client.Get("foo").Err()
+		}, "5s", "100ms").ShouldNot(HaveOccurred())
+	})
+
+	It("supports DB selection", func() {
+		Expect(client.Close()).NotTo(HaveOccurred())
+
+		client = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    sentinelName,
+			SentinelAddrs: []string{":" + sentinelPort},
+			DB:            1,
+		})
+		err := client.Ping().Err()
+		Expect(err).NotTo(HaveOccurred())
+	})
+})

@@ -1,328 +1,420 @@
 package redis
 
 import (
-	"container/list"
 	"errors"
+	"fmt"
 	"log"
-	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"gopkg.in/bufio.v1"
+	"gopkg.in/bsm/ratelimit.v1"
 )
 
 var (
 	errClosed      = errors.New("redis: client is closed")
-	errRateLimited = errors.New("redis: you open connections too fast")
-)
-
-var (
-	zeroTime = time.Time{}
+	errPoolTimeout = errors.New("redis: connection pool timeout")
 )
 
 type pool interface {
+	First() *conn
 	Get() (*conn, bool, error)
 	Put(*conn) error
 	Remove(*conn) error
 	Len() int
-	Size() int
+	FreeLen() int
 	Close() error
-	Filter(func(*conn) bool)
 }
 
-//------------------------------------------------------------------------------
-
-type conn struct {
-	netcn net.Conn
-	rd    *bufio.Reader
-	buf   []byte
-
-	inUse  bool
-	usedAt time.Time
-
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-
-	elem *list.Element
+type connList struct {
+	cns  []*conn
+	mx   sync.Mutex
+	len  int32 // atomic
+	size int32
 }
 
-func newConnFunc(dial func() (net.Conn, error)) func() (*conn, error) {
-	return func() (*conn, error) {
-		netcn, err := dial()
-		if err != nil {
-			return nil, err
+func newConnList(size int) *connList {
+	return &connList{
+		cns:  make([]*conn, 0, size),
+		size: int32(size),
+	}
+}
+
+func (l *connList) Len() int {
+	return int(atomic.LoadInt32(&l.len))
+}
+
+// Reserve reserves place in the list and returns true on success. The
+// caller must add or remove connection if place was reserved.
+func (l *connList) Reserve() bool {
+	len := atomic.AddInt32(&l.len, 1)
+	reserved := len <= l.size
+	if !reserved {
+		atomic.AddInt32(&l.len, -1)
+	}
+	return reserved
+}
+
+// Add adds connection to the list. The caller must reserve place first.
+func (l *connList) Add(cn *conn) {
+	l.mx.Lock()
+	l.cns = append(l.cns, cn)
+	l.mx.Unlock()
+}
+
+// Remove closes connection and removes it from the list.
+func (l *connList) Remove(cn *conn) error {
+	defer l.mx.Unlock()
+	l.mx.Lock()
+
+	if cn == nil {
+		atomic.AddInt32(&l.len, -1)
+		return nil
+	}
+
+	for i, c := range l.cns {
+		if c == cn {
+			l.cns = append(l.cns[:i], l.cns[i+1:]...)
+			atomic.AddInt32(&l.len, -1)
+			return cn.Close()
 		}
-		cn := &conn{
-			netcn: netcn,
-			buf:   make([]byte, 0, 64),
+	}
+
+	if l.closed() {
+		return nil
+	}
+	panic("conn not found in the list")
+}
+
+func (l *connList) Replace(cn, newcn *conn) error {
+	defer l.mx.Unlock()
+	l.mx.Lock()
+
+	for i, c := range l.cns {
+		if c == cn {
+			l.cns[i] = newcn
+			return cn.Close()
 		}
-		cn.rd = bufio.NewReader(cn)
-		return cn, nil
 	}
-}
 
-func (cn *conn) Read(b []byte) (int, error) {
-	if cn.readTimeout != 0 {
-		cn.netcn.SetReadDeadline(time.Now().Add(cn.readTimeout))
-	} else {
-		cn.netcn.SetReadDeadline(zeroTime)
+	if l.closed() {
+		return newcn.Close()
 	}
-	return cn.netcn.Read(b)
+	panic("conn not found in the list")
 }
 
-func (cn *conn) Write(b []byte) (int, error) {
-	if cn.writeTimeout != 0 {
-		cn.netcn.SetWriteDeadline(time.Now().Add(cn.writeTimeout))
-	} else {
-		cn.netcn.SetWriteDeadline(zeroTime)
+func (l *connList) Close() (retErr error) {
+	l.mx.Lock()
+	for _, c := range l.cns {
+		if err := c.Close(); err != nil {
+			retErr = err
+		}
 	}
-	return cn.netcn.Write(b)
+	l.cns = nil
+	atomic.StoreInt32(&l.len, 0)
+	l.mx.Unlock()
+	return retErr
 }
 
-func (cn *conn) RemoteAddr() net.Addr {
-	return cn.netcn.RemoteAddr()
+func (l *connList) closed() bool {
+	return l.cns == nil
 }
-
-func (cn *conn) Close() error {
-	return cn.netcn.Close()
-}
-
-//------------------------------------------------------------------------------
 
 type connPool struct {
-	dial func() (*conn, error)
-	rl   *rateLimiter
+	dialer func() (*conn, error)
 
-	opt *options
+	rl        *ratelimit.RateLimiter
+	opt       *Options
+	conns     *connList
+	freeConns chan *conn
 
-	cond  *sync.Cond
-	conns *list.List
+	_closed int32
 
-	idleNum int
-	closed  bool
+	lastDialErr error
 }
 
-func newConnPool(dial func() (*conn, error), opt *options) *connPool {
-	return &connPool{
-		dial: dial,
-		rl:   newRateLimiter(time.Second, 2*opt.PoolSize),
+func newConnPool(opt *Options) *connPool {
+	p := &connPool{
+		dialer: newConnDialer(opt),
 
-		opt: opt,
-
-		cond:  sync.NewCond(&sync.Mutex{}),
-		conns: list.New(),
+		rl:        ratelimit.New(2*opt.getPoolSize(), time.Second),
+		opt:       opt,
+		conns:     newConnList(opt.getPoolSize()),
+		freeConns: make(chan *conn, opt.getPoolSize()),
 	}
+	if p.opt.getIdleTimeout() > 0 {
+		go p.reaper()
+	}
+	return p
 }
 
-func (p *connPool) new() (*conn, error) {
-	select {
-	case <-p.rl.C:
-	default:
-		return nil, errRateLimited
-	}
-	return p.dial()
+func (p *connPool) closed() bool {
+	return atomic.LoadInt32(&p._closed) == 1
 }
 
-func (p *connPool) Get() (*conn, bool, error) {
-	p.cond.L.Lock()
+func (p *connPool) isIdle(cn *conn) bool {
+	return p.opt.getIdleTimeout() > 0 && time.Since(cn.usedAt) > p.opt.getIdleTimeout()
+}
 
-	if p.closed {
-		p.cond.L.Unlock()
-		return nil, false, errClosed
-	}
-
-	if p.opt.IdleTimeout > 0 {
-		for el := p.conns.Front(); el != nil; el = el.Next() {
-			cn := el.Value.(*conn)
-			if cn.inUse {
-				break
+// First returns first non-idle connection from the pool or nil if
+// there are no connections.
+func (p *connPool) First() *conn {
+	for {
+		select {
+		case cn := <-p.freeConns:
+			if p.isIdle(cn) {
+				p.conns.Remove(cn)
+				continue
 			}
-			if time.Since(cn.usedAt) > p.opt.IdleTimeout {
-				if err := p.remove(cn); err != nil {
-					log.Printf("remove failed: %s", err)
-				}
-			}
+			return cn
+		default:
+			return nil
 		}
 	}
-
-	for p.conns.Len() >= p.opt.PoolSize && p.idleNum == 0 {
-		p.cond.Wait()
-	}
-
-	if p.idleNum > 0 {
-		elem := p.conns.Front()
-		cn := elem.Value.(*conn)
-		if cn.inUse {
-			panic("pool: precondition failed")
-		}
-		cn.inUse = true
-		p.conns.MoveToBack(elem)
-		p.idleNum--
-
-		p.cond.L.Unlock()
-		return cn, false, nil
-	}
-
-	if p.conns.Len() < p.opt.PoolSize {
-		cn, err := p.new()
-		if err != nil {
-			p.cond.L.Unlock()
-			return nil, false, err
-		}
-
-		cn.inUse = true
-		cn.elem = p.conns.PushBack(cn)
-
-		p.cond.L.Unlock()
-		return cn, true, nil
-	}
-
 	panic("not reached")
+}
+
+// wait waits for free non-idle connection. It returns nil on timeout.
+func (p *connPool) wait() *conn {
+	deadline := time.After(p.opt.getPoolTimeout())
+	for {
+		select {
+		case cn := <-p.freeConns:
+			if p.isIdle(cn) {
+				p.Remove(cn)
+				continue
+			}
+			return cn
+		case <-deadline:
+			return nil
+		}
+	}
+	panic("not reached")
+}
+
+// Establish a new connection
+func (p *connPool) new() (*conn, error) {
+	if p.rl.Limit() {
+		err := fmt.Errorf(
+			"redis: you open connections too fast (last error: %v)",
+			p.lastDialErr,
+		)
+		return nil, err
+	}
+
+	cn, err := p.dialer()
+	if err != nil {
+		p.lastDialErr = err
+		return nil, err
+	}
+
+	return cn, nil
+}
+
+// Get returns existed connection from the pool or creates a new one.
+func (p *connPool) Get() (cn *conn, isNew bool, err error) {
+	if p.closed() {
+		err = errClosed
+		return
+	}
+
+	// Fetch first non-idle connection, if available.
+	if cn = p.First(); cn != nil {
+		return
+	}
+
+	// Try to create a new one.
+	if p.conns.Reserve() {
+		cn, err = p.new()
+		if err != nil {
+			p.conns.Remove(nil)
+			return
+		}
+		p.conns.Add(cn)
+		isNew = true
+		return
+	}
+
+	// Otherwise, wait for the available connection.
+	if cn = p.wait(); cn != nil {
+		return
+	}
+
+	err = errPoolTimeout
+	return
 }
 
 func (p *connPool) Put(cn *conn) error {
 	if cn.rd.Buffered() != 0 {
-		b, _ := cn.rd.ReadN(cn.rd.Buffered())
+		b, _ := cn.rd.Peek(cn.rd.Buffered())
 		log.Printf("redis: connection has unread data: %q", b)
 		return p.Remove(cn)
 	}
-
-	if p.opt.IdleTimeout > 0 {
+	if p.opt.getIdleTimeout() > 0 {
 		cn.usedAt = time.Now()
 	}
-
-	p.cond.L.Lock()
-	if p.closed {
-		p.cond.L.Unlock()
-		return errClosed
-	}
-	cn.inUse = false
-	p.conns.MoveToFront(cn.elem)
-	p.idleNum++
-	p.cond.Signal()
-	p.cond.L.Unlock()
-
+	p.freeConns <- cn
 	return nil
 }
 
 func (p *connPool) Remove(cn *conn) error {
-	p.cond.L.Lock()
-	if p.closed {
-		// Noop, connection is already closed.
-		p.cond.L.Unlock()
-		return nil
+	// Replace existing connection with new one and unblock waiter.
+	newcn, err := p.new()
+	if err != nil {
+		log.Printf("redis: new failed: %s", err)
+		return p.conns.Remove(cn)
 	}
-	err := p.remove(cn)
-	p.cond.Signal()
-	p.cond.L.Unlock()
+	err = p.conns.Replace(cn, newcn)
+	p.freeConns <- newcn
 	return err
 }
 
-func (p *connPool) remove(cn *conn) error {
-	p.conns.Remove(cn.elem)
-	cn.elem = nil
-	if !cn.inUse {
-		p.idleNum--
-	}
-	return cn.Close()
-}
-
-// Len returns number of idle connections.
+// Len returns total number of connections.
 func (p *connPool) Len() int {
-	defer p.cond.L.Unlock()
-	p.cond.L.Lock()
-	return p.idleNum
-}
-
-// Size returns number of connections in the pool.
-func (p *connPool) Size() int {
-	defer p.cond.L.Unlock()
-	p.cond.L.Lock()
 	return p.conns.Len()
 }
 
-func (p *connPool) Filter(f func(*conn) bool) {
-	p.cond.L.Lock()
-	for el, next := p.conns.Front(), p.conns.Front(); el != nil; el = next {
-		next = el.Next()
-		cn := el.Value.(*conn)
-		if !f(cn) {
-			p.remove(cn)
-		}
-	}
-	p.cond.L.Unlock()
+// FreeLen returns number of free connections.
+func (p *connPool) FreeLen() int {
+	return len(p.freeConns)
 }
 
-func (p *connPool) Close() error {
-	defer p.cond.L.Unlock()
-	p.cond.L.Lock()
-	if p.closed {
-		return nil
+func (p *connPool) Close() (retErr error) {
+	if !atomic.CompareAndSwapInt32(&p._closed, 0, 1) {
+		return errClosed
 	}
-	p.closed = true
-	var retErr error
-	for {
-		e := p.conns.Front()
-		if e == nil {
+	// Wait for app to free connections, but don't close them immediately.
+	for i := 0; i < p.Len(); i++ {
+		if cn := p.wait(); cn == nil {
 			break
 		}
-		if err := p.remove(e.Value.(*conn)); err != nil {
-			log.Printf("cn.Close failed: %s", err)
-			retErr = err
-		}
+	}
+	// Close all connections.
+	if err := p.conns.Close(); err != nil {
+		retErr = err
 	}
 	return retErr
+}
+
+func (p *connPool) reaper() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for _ = range ticker.C {
+		if p.closed() {
+			break
+		}
+
+		// pool.First removes idle connections from the pool and
+		// returns first non-idle connection. So just put returned
+		// connection back.
+		if cn := p.First(); cn != nil {
+			p.Put(cn)
+		}
+	}
 }
 
 //------------------------------------------------------------------------------
 
 type singleConnPool struct {
-	pool pool
-
-	cnMtx sync.Mutex
-	cn    *conn
-
-	reusable bool
-
-	closed bool
+	cn *conn
 }
 
-func newSingleConnPool(pool pool, reusable bool) *singleConnPool {
+func newSingleConnPool(cn *conn) *singleConnPool {
 	return &singleConnPool{
+		cn: cn,
+	}
+}
+
+func (p *singleConnPool) First() *conn {
+	return p.cn
+}
+
+func (p *singleConnPool) Get() (*conn, bool, error) {
+	return p.cn, false, nil
+}
+
+func (p *singleConnPool) Put(cn *conn) error {
+	if p.cn != cn {
+		panic("p.cn != cn")
+	}
+	return nil
+}
+
+func (p *singleConnPool) Remove(cn *conn) error {
+	if p.cn != cn {
+		panic("p.cn != cn")
+	}
+	return nil
+}
+
+func (p *singleConnPool) Len() int {
+	return 1
+}
+
+func (p *singleConnPool) FreeLen() int {
+	return 0
+}
+
+func (p *singleConnPool) Close() error {
+	return nil
+}
+
+//------------------------------------------------------------------------------
+
+type stickyConnPool struct {
+	pool     pool
+	reusable bool
+
+	cn     *conn
+	closed bool
+	mx     sync.Mutex
+}
+
+func newStickyConnPool(pool pool, reusable bool) *stickyConnPool {
+	return &stickyConnPool{
 		pool:     pool,
 		reusable: reusable,
 	}
 }
 
-func (p *singleConnPool) SetConn(cn *conn) {
-	p.cnMtx.Lock()
-	p.cn = cn
-	p.cnMtx.Unlock()
+func (p *stickyConnPool) First() *conn {
+	p.mx.Lock()
+	cn := p.cn
+	p.mx.Unlock()
+	return cn
 }
 
-func (p *singleConnPool) Get() (*conn, bool, error) {
-	defer p.cnMtx.Unlock()
-	p.cnMtx.Lock()
+func (p *stickyConnPool) Get() (cn *conn, isNew bool, err error) {
+	defer p.mx.Unlock()
+	p.mx.Lock()
 
 	if p.closed {
-		return nil, false, errClosed
+		err = errClosed
+		return
 	}
 	if p.cn != nil {
-		return p.cn, false, nil
+		cn = p.cn
+		return
 	}
 
-	cn, isNew, err := p.pool.Get()
+	cn, isNew, err = p.pool.Get()
 	if err != nil {
-		return nil, false, err
+		return
 	}
 	p.cn = cn
-
-	return p.cn, isNew, nil
+	return
 }
 
-func (p *singleConnPool) Put(cn *conn) error {
-	defer p.cnMtx.Unlock()
-	p.cnMtx.Lock()
+func (p *stickyConnPool) put() (err error) {
+	err = p.pool.Put(p.cn)
+	p.cn = nil
+	return err
+}
+
+func (p *stickyConnPool) Put(cn *conn) error {
+	defer p.mx.Unlock()
+	p.mx.Lock()
 	if p.cn != cn {
 		panic("p.cn != cn")
 	}
@@ -332,66 +424,54 @@ func (p *singleConnPool) Put(cn *conn) error {
 	return nil
 }
 
-func (p *singleConnPool) put() error {
-	err := p.pool.Put(p.cn)
+func (p *stickyConnPool) remove() (err error) {
+	err = p.pool.Remove(p.cn)
 	p.cn = nil
 	return err
 }
 
-func (p *singleConnPool) Remove(cn *conn) error {
-	defer p.cnMtx.Unlock()
-	p.cnMtx.Lock()
+func (p *stickyConnPool) Remove(cn *conn) error {
+	defer p.mx.Unlock()
+	p.mx.Lock()
 	if p.cn == nil {
 		panic("p.cn == nil")
 	}
-	if p.cn != cn {
+	if cn != nil && p.cn != cn {
 		panic("p.cn != cn")
 	}
 	if p.closed {
 		return errClosed
 	}
-	return p.remove()
-}
-
-func (p *singleConnPool) remove() error {
-	err := p.pool.Remove(p.cn)
-	p.cn = nil
-	return err
-}
-
-func (p *singleConnPool) Len() int {
-	defer p.cnMtx.Unlock()
-	p.cnMtx.Lock()
-	if p.cn == nil {
-		return 0
-	}
-	return 1
-}
-
-func (p *singleConnPool) Size() int {
-	defer p.cnMtx.Unlock()
-	p.cnMtx.Lock()
-	if p.cn == nil {
-		return 0
-	}
-	return 1
-}
-
-func (p *singleConnPool) Filter(f func(*conn) bool) {
-	p.cnMtx.Lock()
-	if p.cn != nil {
-		if !f(p.cn) {
-			p.remove()
-		}
-	}
-	p.cnMtx.Unlock()
-}
-
-func (p *singleConnPool) Close() error {
-	defer p.cnMtx.Unlock()
-	p.cnMtx.Lock()
-	if p.closed {
+	if cn == nil {
+		return p.remove()
+	} else {
 		return nil
+	}
+}
+
+func (p *stickyConnPool) Len() int {
+	defer p.mx.Unlock()
+	p.mx.Lock()
+	if p.cn == nil {
+		return 0
+	}
+	return 1
+}
+
+func (p *stickyConnPool) FreeLen() int {
+	defer p.mx.Unlock()
+	p.mx.Lock()
+	if p.cn == nil {
+		return 1
+	}
+	return 0
+}
+
+func (p *stickyConnPool) Close() error {
+	defer p.mx.Unlock()
+	p.mx.Lock()
+	if p.closed {
+		return errClosed
 	}
 	p.closed = true
 	var err error

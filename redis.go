@@ -1,6 +1,7 @@
-package redis
+package redis // import "gopkg.in/redis.v3"
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"time"
@@ -8,160 +9,140 @@ import (
 
 type baseClient struct {
 	connPool pool
-	opt      *options
-	cmds     []Cmder
+	opt      *Options
 }
 
-func (c *baseClient) writeCmd(cn *conn, cmds ...Cmder) error {
-	buf := cn.buf[:0]
-	for _, cmd := range cmds {
-		buf = appendArgs(buf, cmd.args())
+func (c *baseClient) String() string {
+	return fmt.Sprintf("Redis<%s db:%d>", c.opt.Addr, c.opt.DB)
+}
+
+func (c *baseClient) conn() (*conn, bool, error) {
+	return c.connPool.Get()
+}
+
+func (c *baseClient) putConn(cn *conn, ei error) {
+	var err error
+	if isBadConn(cn, ei) {
+		err = c.connPool.Remove(cn)
+	} else {
+		err = c.connPool.Put(cn)
 	}
-
-	_, err := cn.Write(buf)
-	return err
-}
-
-func (c *baseClient) conn() (*conn, error) {
-	cn, isNew, err := c.connPool.Get()
 	if err != nil {
-		return nil, err
+		log.Printf("redis: putConn failed: %s", err)
 	}
+}
 
-	if isNew {
-		if err := c.initConn(cn); err != nil {
-			c.removeConn(cn)
-			return nil, err
+func (c *baseClient) process(cmd Cmder) {
+	for i := 0; i <= c.opt.MaxRetries; i++ {
+		if i > 0 {
+			cmd.reset()
 		}
-	}
 
-	return cn, nil
-}
-
-func (c *baseClient) initConn(cn *conn) error {
-	if c.opt.Password == "" && c.opt.DB == 0 {
-		return nil
-	}
-
-	pool := newSingleConnPool(c.connPool, false)
-	pool.SetConn(cn)
-
-	// Client is not closed because we want to reuse underlying connection.
-	client := &Client{
-		baseClient: &baseClient{
-			opt:      c.opt,
-			connPool: pool,
-		},
-	}
-
-	if c.opt.Password != "" {
-		if err := client.Auth(c.opt.Password).Err(); err != nil {
-			return err
+		cn, _, err := c.conn()
+		if err != nil {
+			cmd.setErr(err)
+			return
 		}
-	}
 
-	if c.opt.DB > 0 {
-		if err := client.Select(c.opt.DB).Err(); err != nil {
-			return err
+		if timeout := cmd.writeTimeout(); timeout != nil {
+			cn.WriteTimeout = *timeout
+		} else {
+			cn.WriteTimeout = c.opt.WriteTimeout
 		}
-	}
 
-	return nil
-}
+		if timeout := cmd.readTimeout(); timeout != nil {
+			cn.ReadTimeout = *timeout
+		} else {
+			cn.ReadTimeout = c.opt.ReadTimeout
+		}
 
-func (c *baseClient) freeConn(cn *conn, ei error) error {
-	if cn.rd.Buffered() > 0 {
-		return c.connPool.Remove(cn)
-	}
-	if _, ok := ei.(redisError); ok {
-		return c.connPool.Put(cn)
-	}
-	return c.connPool.Remove(cn)
-}
+		if err := cn.writeCmds(cmd); err != nil {
+			c.putConn(cn, err)
+			cmd.setErr(err)
+			if shouldRetry(err) {
+				continue
+			}
+			return
+		}
 
-func (c *baseClient) removeConn(cn *conn) {
-	if err := c.connPool.Remove(cn); err != nil {
-		log.Printf("pool.Remove failed: %s", err)
-	}
-}
+		err = cmd.readReply(cn)
+		c.putConn(cn, err)
+		if shouldRetry(err) {
+			continue
+		}
 
-func (c *baseClient) putConn(cn *conn) {
-	if err := c.connPool.Put(cn); err != nil {
-		log.Printf("pool.Put failed: %s", err)
-	}
-}
-
-func (c *baseClient) Process(cmd Cmder) {
-	if c.cmds == nil {
-		c.run(cmd)
-	} else {
-		c.cmds = append(c.cmds, cmd)
-	}
-}
-
-func (c *baseClient) run(cmd Cmder) {
-	cn, err := c.conn()
-	if err != nil {
-		cmd.setErr(err)
 		return
 	}
-
-	if timeout := cmd.writeTimeout(); timeout != nil {
-		cn.writeTimeout = *timeout
-	} else {
-		cn.writeTimeout = c.opt.WriteTimeout
-	}
-
-	if timeout := cmd.readTimeout(); timeout != nil {
-		cn.readTimeout = *timeout
-	} else {
-		cn.readTimeout = c.opt.ReadTimeout
-	}
-
-	if err := c.writeCmd(cn, cmd); err != nil {
-		c.freeConn(cn, err)
-		cmd.setErr(err)
-		return
-	}
-
-	if err := cmd.parseReply(cn.rd); err != nil {
-		c.freeConn(cn, err)
-		return
-	}
-
-	c.putConn(cn)
 }
 
 // Close closes the client, releasing any open resources.
+//
+// It is rare to Close a Client, as the Client is meant to be
+// long-lived and shared between many goroutines.
 func (c *baseClient) Close() error {
 	return c.connPool.Close()
 }
 
 //------------------------------------------------------------------------------
 
-type options struct {
-	Password string
-	DB       int64
+type Options struct {
+	// The network type, either tcp or unix.
+	// Default is tcp.
+	Network string
+	// host:port address.
+	Addr string
 
-	DialTimeout  time.Duration
-	ReadTimeout  time.Duration
+	// Dialer creates new network connection and has priority over
+	// Network and Addr options.
+	Dialer func() (net.Conn, error)
+
+	// An optional password. Must match the password specified in the
+	// requirepass server configuration option.
+	Password string
+	// A database to be selected after connecting to server.
+	DB int64
+
+	// The maximum number of retries before giving up.
+	// Default is to not retry failed commands.
+	MaxRetries int
+
+	// Sets the deadline for establishing new connections. If reached,
+	// dial will fail with a timeout.
+	DialTimeout time.Duration
+	// Sets the deadline for socket reads. If reached, commands will
+	// fail with a timeout instead of blocking.
+	ReadTimeout time.Duration
+	// Sets the deadline for socket writes. If reached, commands will
+	// fail with a timeout instead of blocking.
 	WriteTimeout time.Duration
 
-	PoolSize    int
+	// The maximum number of socket connections.
+	// Default is 10 connections.
+	PoolSize int
+	// Specifies amount of time client waits for connection if all
+	// connections are busy before returning an error.
+	// Default is 5 seconds.
+	PoolTimeout time.Duration
+	// Specifies amount of time after which client closes idle
+	// connections. Should be less than server's timeout.
+	// Default is to not close idle connections.
 	IdleTimeout time.Duration
 }
 
-type Options struct {
-	Addr     string
-	Password string
-	DB       int64
+func (opt *Options) getNetwork() string {
+	if opt.Network == "" {
+		return "tcp"
+	}
+	return opt.Network
+}
 
-	DialTimeout  time.Duration
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-
-	PoolSize    int
-	IdleTimeout time.Duration
+func (opt *Options) getDialer() func() (net.Conn, error) {
+	if opt.Dialer == nil {
+		opt.Dialer = func() (net.Conn, error) {
+			return net.DialTimeout(opt.getNetwork(), opt.Addr, opt.getDialTimeout())
+		}
+	}
+	return opt.Dialer
 }
 
 func (opt *Options) getPoolSize() int {
@@ -178,41 +159,37 @@ func (opt *Options) getDialTimeout() time.Duration {
 	return opt.DialTimeout
 }
 
-func (opt *Options) options() *options {
-	return &options{
-		DB:       opt.DB,
-		Password: opt.Password,
-
-		DialTimeout:  opt.getDialTimeout(),
-		ReadTimeout:  opt.ReadTimeout,
-		WriteTimeout: opt.WriteTimeout,
-
-		PoolSize:    opt.getPoolSize(),
-		IdleTimeout: opt.IdleTimeout,
+func (opt *Options) getPoolTimeout() time.Duration {
+	if opt.PoolTimeout == 0 {
+		return 1 * time.Second
 	}
+	return opt.PoolTimeout
 }
 
+func (opt *Options) getIdleTimeout() time.Duration {
+	return opt.IdleTimeout
+}
+
+//------------------------------------------------------------------------------
+
+// Client is a Redis client representing a pool of zero or more
+// underlying connections. It's safe for concurrent use by multiple
+// goroutines.
 type Client struct {
 	*baseClient
+	commandable
 }
 
-func newClient(clOpt *Options, network string) *Client {
-	opt := clOpt.options()
-	dialer := func() (net.Conn, error) {
-		return net.DialTimeout(network, clOpt.Addr, opt.DialTimeout)
-	}
+func newClient(opt *Options, pool pool) *Client {
+	base := &baseClient{opt: opt, connPool: pool}
 	return &Client{
-		baseClient: &baseClient{
-			opt:      opt,
-			connPool: newConnPool(newConnFunc(dialer), opt),
-		},
+		baseClient:  base,
+		commandable: commandable{process: base.process},
 	}
 }
 
-func NewTCPClient(opt *Options) *Client {
-	return newClient(opt, "tcp")
-}
-
-func NewUnixClient(opt *Options) *Client {
-	return newClient(opt, "unix")
+// NewClient returns a client to the Redis Server specified by Options.
+func NewClient(opt *Options) *Client {
+	pool := newConnPool(opt)
+	return newClient(opt, pool)
 }

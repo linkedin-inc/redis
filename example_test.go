@@ -3,21 +3,23 @@ package redis_test
 import (
 	"fmt"
 	"strconv"
+	"sync"
+	"time"
 
-	"gopkg.in/redis.v2"
+	"gopkg.in/redis.v3"
 )
 
 var client *redis.Client
 
 func init() {
-	client = redis.NewTCPClient(&redis.Options{
+	client = redis.NewClient(&redis.Options{
 		Addr: ":6379",
 	})
 	client.FlushDb()
 }
 
-func ExampleNewTCPClient() {
-	client := redis.NewTCPClient(&redis.Options{
+func ExampleNewClient() {
+	client := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: "", // no password set
 		DB:       0,  // use default DB
@@ -29,24 +31,72 @@ func ExampleNewTCPClient() {
 }
 
 func ExampleNewFailoverClient() {
+	// See http://redis.io/topics/sentinel for instructions how to
+	// setup Redis Sentinel.
 	client := redis.NewFailoverClient(&redis.FailoverOptions{
 		MasterName:    "master",
 		SentinelAddrs: []string{":26379"},
 	})
+	client.Ping()
+}
 
-	pong, err := client.Ping().Result()
-	fmt.Println(pong, err)
-	// Output: PONG <nil>
+func ExampleNewClusterClient() {
+	// See http://redis.io/topics/cluster-tutorial for instructions
+	// how to setup Redis Cluster.
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: []string{":7000", ":7001", ":7002", ":7003", ":7004", ":7005"},
+	})
+	client.Ping()
+}
+
+func ExampleNewRing() {
+	client := redis.NewRing(&redis.RingOptions{
+		Addrs: map[string]string{
+			"shard1": ":7000",
+			"shard2": ":7001",
+			"shard3": ":7002",
+		},
+	})
+	client.Ping()
 }
 
 func ExampleClient() {
-	if err := client.Set("foo", "bar").Err(); err != nil {
+	err := client.Set("key", "value", 0).Err()
+	if err != nil {
 		panic(err)
 	}
 
-	v, err := client.Get("hello").Result()
-	fmt.Printf("%q %q %v", v, err, err == redis.Nil)
-	// Output: "" "redis: nil" true
+	val, err := client.Get("key").Result()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("key", val)
+
+	val2, err := client.Get("key2").Result()
+	if err == redis.Nil {
+		fmt.Println("key2 does not exists")
+	} else if err != nil {
+		panic(err)
+	} else {
+		fmt.Println("key2", val2)
+	}
+	// Output: key value
+	// key2 does not exists
+}
+
+func ExampleClient_Set() {
+	// Last argument is expiration. Zero means the key has no
+	// expiration time.
+	err := client.Set("key", "value", 0).Err()
+	if err != nil {
+		panic(err)
+	}
+
+	// key2 will expire in an hour.
+	err = client.Set("key2", "value", time.Hour).Err()
+	if err != nil {
+		panic(err)
+	}
 }
 
 func ExampleClient_Incr() {
@@ -59,112 +109,175 @@ func ExampleClient_Incr() {
 	// Output: 1 <nil>
 }
 
+func ExampleClient_Scan() {
+	client.FlushDb()
+	for i := 0; i < 33; i++ {
+		err := client.Set(fmt.Sprintf("key%d", i), "value", 0).Err()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	var cursor int64
+	var n int
+	for {
+		var keys []string
+		var err error
+		cursor, keys, err = client.Scan(cursor, "", 10).Result()
+		if err != nil {
+			panic(err)
+		}
+		n += len(keys)
+		if cursor == 0 {
+			break
+		}
+	}
+
+	fmt.Printf("found %d keys\n", n)
+	// Output: found 33 keys
+}
+
 func ExampleClient_Pipelined() {
-	cmds, err := client.Pipelined(func(c *redis.Pipeline) error {
-		c.Set("key1", "hello1")
-		c.Get("key1")
+	var incr *redis.IntCmd
+	_, err := client.Pipelined(func(pipe *redis.Pipeline) error {
+		incr = pipe.Incr("counter1")
+		pipe.Expire("counter1", time.Hour)
 		return nil
 	})
-	fmt.Println(err)
-	set := cmds[0].(*redis.StatusCmd)
-	fmt.Println(set)
-	get := cmds[1].(*redis.StringCmd)
-	fmt.Println(get)
-	// Output: <nil>
-	// SET key1 hello1: OK
-	// GET key1: hello1
+	fmt.Println(incr.Val(), err)
+	// Output: 1 <nil>
 }
 
 func ExamplePipeline() {
-	pipeline := client.Pipeline()
-	set := pipeline.Set("key1", "hello1")
-	get := pipeline.Get("key1")
-	cmds, err := pipeline.Exec()
-	fmt.Println(cmds, err)
-	fmt.Println(set)
-	fmt.Println(get)
-	// Output: [SET key1 hello1: OK GET key1: hello1] <nil>
-	// SET key1 hello1: OK
-	// GET key1: hello1
+	pipe := client.Pipeline()
+	defer pipe.Close()
+
+	incr := pipe.Incr("counter2")
+	pipe.Expire("counter2", time.Hour)
+	_, err := pipe.Exec()
+	fmt.Println(incr.Val(), err)
+	// Output: 1 <nil>
 }
 
-func ExampleMulti() {
-	incr := func(tx *redis.Multi) ([]redis.Cmder, error) {
-		s, err := tx.Get("key").Result()
-		if err != nil && err != redis.Nil {
-			return nil, err
-		}
-		n, _ := strconv.ParseInt(s, 10, 64)
+func ExampleClient_Watch() {
+	var incr func(string) error
 
-		return tx.Exec(func() error {
-			tx.Set("key", strconv.FormatInt(n+1, 10))
+	// Transactionally increments key using GET and SET commands.
+	incr = func(key string) error {
+		tx, err := client.Watch(key)
+		if err != nil {
+			return err
+		}
+		defer tx.Close()
+
+		n, err := tx.Get(key).Int64()
+		if err != nil && err != redis.Nil {
+			return err
+		}
+
+		_, err = tx.Exec(func() error {
+			tx.Set(key, strconv.FormatInt(n+1, 10), 0)
 			return nil
 		})
-	}
-
-	client.Del("key")
-
-	tx := client.Multi()
-	defer tx.Close()
-
-	watch := tx.Watch("key")
-	_ = watch.Err()
-
-	for {
-		cmds, err := incr(tx)
 		if err == redis.TxFailedErr {
-			continue
-		} else if err != nil {
-			panic(err)
+			return incr(key)
 		}
-		fmt.Println(cmds, err)
-		break
+		return err
 	}
 
-	// Output: [SET key 1: OK] <nil>
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			err := incr("counter3")
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	n, err := client.Get("counter3").Int64()
+	fmt.Println(n, err)
+	// Output: 100 <nil>
 }
 
 func ExamplePubSub() {
-	pubsub := client.PubSub()
+	pubsub, err := client.Subscribe("mychannel")
+	if err != nil {
+		panic(err)
+	}
 	defer pubsub.Close()
 
-	err := pubsub.Subscribe("mychannel")
-	_ = err
+	err = client.Publish("mychannel", "hello").Err()
+	if err != nil {
+		panic(err)
+	}
 
-	msg, err := pubsub.Receive()
-	fmt.Println(msg, err)
+	msg, err := pubsub.ReceiveMessage()
+	if err != nil {
+		panic(err)
+	}
 
-	pub := client.Publish("mychannel", "hello")
-	_ = pub.Err()
+	fmt.Println(msg.Channel, msg.Payload)
+	// Output: mychannel hello
+}
 
-	msg, err = pubsub.Receive()
-	fmt.Println(msg, err)
+func ExamplePubSub_Receive() {
+	pubsub, err := client.Subscribe("mychannel")
+	if err != nil {
+		panic(err)
+	}
+	defer pubsub.Close()
 
-	// Output: subscribe: mychannel <nil>
-	// Message<mychannel: hello> <nil>
+	err = client.Publish("mychannel", "hello").Err()
+	if err != nil {
+		panic(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		msgi, err := pubsub.ReceiveTimeout(100 * time.Millisecond)
+		if err != nil {
+			panic(err)
+		}
+
+		switch msg := msgi.(type) {
+		case *redis.Subscription:
+			fmt.Println(msg.Kind, msg.Channel)
+		case *redis.Message:
+			fmt.Println(msg.Channel, msg.Payload)
+		default:
+			panic(fmt.Sprintf("unknown message: %#v", msgi))
+		}
+	}
+
+	// Output: subscribe mychannel
+	// mychannel hello
 }
 
 func ExampleScript() {
-	setnx := redis.NewScript(`
-        if redis.call("get", KEYS[1]) == false then
-            redis.call("set", KEYS[1], ARGV[1])
-            return 1
-        end
-        return 0
-    `)
+	IncrByXX := redis.NewScript(`
+		if redis.call("GET", KEYS[1]) ~= false then
+			return redis.call("INCRBY", KEYS[1], ARGV[1])
+		end
+		return false
+	`)
 
-	v1, err := setnx.Run(client, []string{"keynx"}, []string{"foo"}).Result()
-	fmt.Println(v1.(int64), err)
+	n, err := IncrByXX.Run(client, []string{"xx_counter"}, []string{"2"}).Result()
+	fmt.Println(n, err)
 
-	v2, err := setnx.Run(client, []string{"keynx"}, []string{"bar"}).Result()
-	fmt.Println(v2.(int64), err)
+	err = client.Set("xx_counter", "40", 0).Err()
+	if err != nil {
+		panic(err)
+	}
 
-	get := client.Get("keynx")
-	fmt.Println(get)
+	n, err = IncrByXX.Run(client, []string{"xx_counter"}, []string{"2"}).Result()
+	fmt.Println(n, err)
 
-	// Output: 1 <nil>
-	// 0 <nil>
-	// GET keynx: foo
+	// Output: <nil> redis: nil
+	// 42 <nil>
 }
 
 func Example_customCommand() {

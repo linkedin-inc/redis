@@ -1,183 +1,261 @@
 package redis
 
 import (
+	"io"
+	"log"
 	"strconv"
 	"time"
 )
+
+func formatInt(i int64) string {
+	return strconv.FormatInt(i, 10)
+}
+
+func formatUint(i uint64) string {
+	return strconv.FormatUint(i, 10)
+}
 
 func formatFloat(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-func readTimeout(sec int64) time.Duration {
-	if sec == 0 {
+func readTimeout(timeout time.Duration) time.Duration {
+	if timeout == 0 {
 		return 0
 	}
-	return time.Duration(sec+1) * time.Second
+	return timeout + time.Second
+}
+
+func usePrecise(dur time.Duration) bool {
+	return dur < time.Second || dur%time.Second != 0
+}
+
+func formatMs(dur time.Duration) string {
+	if dur > 0 && dur < time.Millisecond {
+		log.Printf(
+			"redis: specified duration is %s, but minimal supported value is %s",
+			dur, time.Millisecond,
+		)
+	}
+	return formatInt(int64(dur / time.Millisecond))
+}
+
+func formatSec(dur time.Duration) string {
+	if dur > 0 && dur < time.Second {
+		log.Printf(
+			"redis: specified duration is %s, but minimal supported value is %s",
+			dur, time.Second,
+		)
+	}
+	return formatInt(int64(dur / time.Second))
+}
+
+type commandable struct {
+	process func(cmd Cmder)
+}
+
+func (c *commandable) Process(cmd Cmder) {
+	c.process(cmd)
 }
 
 //------------------------------------------------------------------------------
 
-func (c *Client) Auth(password string) *StatusCmd {
-	cmd := NewStatusCmd("AUTH", password)
+func (c *commandable) Auth(password string) *StatusCmd {
+	cmd := newKeylessStatusCmd("AUTH", password)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Echo(message string) *StringCmd {
+func (c *commandable) Echo(message string) *StringCmd {
 	cmd := NewStringCmd("ECHO", message)
+	cmd._clusterKeyPos = 0
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Ping() *StatusCmd {
-	cmd := NewStatusCmd("PING")
+func (c *commandable) Ping() *StatusCmd {
+	cmd := newKeylessStatusCmd("PING")
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Quit() *StatusCmd {
+func (c *commandable) Quit() *StatusCmd {
 	panic("not implemented")
 }
 
-func (c *Client) Select(index int64) *StatusCmd {
-	cmd := NewStatusCmd("SELECT", strconv.FormatInt(index, 10))
+func (c *commandable) Select(index int64) *StatusCmd {
+	cmd := newKeylessStatusCmd("SELECT", index)
 	c.Process(cmd)
 	return cmd
 }
 
 //------------------------------------------------------------------------------
 
-func (c *Client) Del(keys ...string) *IntCmd {
-	args := append([]string{"DEL"}, keys...)
+func (c *commandable) Del(keys ...string) *IntCmd {
+	args := make([]interface{}, 1+len(keys))
+	args[0] = "DEL"
+	for i, key := range keys {
+		args[1+i] = key
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Dump(key string) *StringCmd {
+func (c *commandable) Dump(key string) *StringCmd {
 	cmd := NewStringCmd("DUMP", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Exists(key string) *BoolCmd {
+func (c *commandable) Exists(key string) *BoolCmd {
 	cmd := NewBoolCmd("EXISTS", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Expire(key string, dur time.Duration) *BoolCmd {
-	cmd := NewBoolCmd("EXPIRE", key, strconv.FormatInt(int64(dur/time.Second), 10))
+func (c *commandable) Expire(key string, expiration time.Duration) *BoolCmd {
+	cmd := NewBoolCmd("EXPIRE", key, formatSec(expiration))
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ExpireAt(key string, tm time.Time) *BoolCmd {
-	cmd := NewBoolCmd("EXPIREAT", key, strconv.FormatInt(tm.Unix(), 10))
+func (c *commandable) ExpireAt(key string, tm time.Time) *BoolCmd {
+	cmd := NewBoolCmd("EXPIREAT", key, tm.Unix())
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Keys(pattern string) *StringSliceCmd {
+func (c *commandable) Keys(pattern string) *StringSliceCmd {
 	cmd := NewStringSliceCmd("KEYS", pattern)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Migrate(host, port, key string, db, timeout int64) *StatusCmd {
+func (c *commandable) Migrate(host, port, key string, db int64, timeout time.Duration) *StatusCmd {
 	cmd := NewStatusCmd(
 		"MIGRATE",
 		host,
 		port,
 		key,
-		strconv.FormatInt(db, 10),
-		strconv.FormatInt(timeout, 10),
+		db,
+		formatMs(timeout),
 	)
+	cmd._clusterKeyPos = 3
 	cmd.setReadTimeout(readTimeout(timeout))
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Move(key string, db int64) *BoolCmd {
-	cmd := NewBoolCmd("MOVE", key, strconv.FormatInt(db, 10))
+func (c *commandable) Move(key string, db int64) *BoolCmd {
+	cmd := NewBoolCmd("MOVE", key, db)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ObjectRefCount(keys ...string) *IntCmd {
-	args := append([]string{"OBJECT", "REFCOUNT"}, keys...)
+func (c *commandable) ObjectRefCount(keys ...string) *IntCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "OBJECT"
+	args[1] = "REFCOUNT"
+	for i, key := range keys {
+		args[2+i] = key
+	}
 	cmd := NewIntCmd(args...)
+	cmd._clusterKeyPos = 2
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ObjectEncoding(keys ...string) *StringCmd {
-	args := append([]string{"OBJECT", "ENCODING"}, keys...)
+func (c *commandable) ObjectEncoding(keys ...string) *StringCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "OBJECT"
+	args[1] = "ENCODING"
+	for i, key := range keys {
+		args[2+i] = key
+	}
 	cmd := NewStringCmd(args...)
+	cmd._clusterKeyPos = 2
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ObjectIdleTime(keys ...string) *DurationCmd {
-	args := append([]string{"OBJECT", "IDLETIME"}, keys...)
+func (c *commandable) ObjectIdleTime(keys ...string) *DurationCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "OBJECT"
+	args[1] = "IDLETIME"
+	for i, key := range keys {
+		args[2+i] = key
+	}
 	cmd := NewDurationCmd(time.Second, args...)
+	cmd._clusterKeyPos = 2
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Persist(key string) *BoolCmd {
+func (c *commandable) Persist(key string) *BoolCmd {
 	cmd := NewBoolCmd("PERSIST", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) PExpire(key string, dur time.Duration) *BoolCmd {
-	cmd := NewBoolCmd("PEXPIRE", key, strconv.FormatInt(int64(dur/time.Millisecond), 10))
+func (c *commandable) PExpire(key string, expiration time.Duration) *BoolCmd {
+	cmd := NewBoolCmd("PEXPIRE", key, formatMs(expiration))
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) PExpireAt(key string, tm time.Time) *BoolCmd {
+func (c *commandable) PExpireAt(key string, tm time.Time) *BoolCmd {
 	cmd := NewBoolCmd(
 		"PEXPIREAT",
 		key,
-		strconv.FormatInt(tm.UnixNano()/int64(time.Millisecond), 10),
+		tm.UnixNano()/int64(time.Millisecond),
 	)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) PTTL(key string) *DurationCmd {
+func (c *commandable) PTTL(key string) *DurationCmd {
 	cmd := NewDurationCmd(time.Millisecond, "PTTL", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) RandomKey() *StringCmd {
+func (c *commandable) RandomKey() *StringCmd {
 	cmd := NewStringCmd("RANDOMKEY")
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Rename(key, newkey string) *StatusCmd {
+func (c *commandable) Rename(key, newkey string) *StatusCmd {
 	cmd := NewStatusCmd("RENAME", key, newkey)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) RenameNX(key, newkey string) *BoolCmd {
+func (c *commandable) RenameNX(key, newkey string) *BoolCmd {
 	cmd := NewBoolCmd("RENAMENX", key, newkey)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Restore(key string, ttl int64, value string) *StatusCmd {
+func (c *commandable) Restore(key string, ttl time.Duration, value string) *StatusCmd {
 	cmd := NewStatusCmd(
 		"RESTORE",
 		key,
-		strconv.FormatInt(ttl, 10),
+		formatMs(ttl),
 		value,
+	)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) RestoreReplace(key string, ttl time.Duration, value string) *StatusCmd {
+	cmd := NewStatusCmd(
+		"RESTORE",
+		key,
+		formatMs(ttl),
+		value,
+		"REPLACE",
 	)
 	c.Process(cmd)
 	return cmd
@@ -192,13 +270,13 @@ type Sort struct {
 	Store         string
 }
 
-func (c *Client) Sort(key string, sort Sort) *StringSliceCmd {
-	args := []string{"SORT", key}
+func (c *commandable) Sort(key string, sort Sort) *StringSliceCmd {
+	args := []interface{}{"SORT", key}
 	if sort.By != "" {
-		args = append(args, sort.By)
+		args = append(args, "BY", sort.By)
 	}
 	if sort.Offset != 0 || sort.Count != 0 {
-		args = append(args, "LIMIT", formatFloat(sort.Offset), formatFloat(sort.Count))
+		args = append(args, "LIMIT", sort.Offset, sort.Count)
 	}
 	for _, get := range sort.Get {
 		args = append(args, "GET", get)
@@ -217,64 +295,64 @@ func (c *Client) Sort(key string, sort Sort) *StringSliceCmd {
 	return cmd
 }
 
-func (c *Client) TTL(key string) *DurationCmd {
+func (c *commandable) TTL(key string) *DurationCmd {
 	cmd := NewDurationCmd(time.Second, "TTL", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Type(key string) *StatusCmd {
+func (c *commandable) Type(key string) *StatusCmd {
 	cmd := NewStatusCmd("TYPE", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Scan(cursor int64, match string, count int64) *ScanCmd {
-	args := []string{"SCAN", strconv.FormatInt(cursor, 10)}
+func (c *commandable) Scan(cursor int64, match string, count int64) *ScanCmd {
+	args := []interface{}{"SCAN", cursor}
 	if match != "" {
 		args = append(args, "MATCH", match)
 	}
 	if count > 0 {
-		args = append(args, "COUNT", strconv.FormatInt(count, 10))
+		args = append(args, "COUNT", count)
 	}
 	cmd := NewScanCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SScan(key string, cursor int64, match string, count int64) *ScanCmd {
-	args := []string{"SSCAN", key, strconv.FormatInt(cursor, 10)}
+func (c *commandable) SScan(key string, cursor int64, match string, count int64) *ScanCmd {
+	args := []interface{}{"SSCAN", key, cursor}
 	if match != "" {
 		args = append(args, "MATCH", match)
 	}
 	if count > 0 {
-		args = append(args, "COUNT", strconv.FormatInt(count, 10))
+		args = append(args, "COUNT", count)
 	}
 	cmd := NewScanCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HScan(key string, cursor int64, match string, count int64) *ScanCmd {
-	args := []string{"HSCAN", key, strconv.FormatInt(cursor, 10)}
+func (c *commandable) HScan(key string, cursor int64, match string, count int64) *ScanCmd {
+	args := []interface{}{"HSCAN", key, cursor}
 	if match != "" {
 		args = append(args, "MATCH", match)
 	}
 	if count > 0 {
-		args = append(args, "COUNT", strconv.FormatInt(count, 10))
+		args = append(args, "COUNT", count)
 	}
 	cmd := NewScanCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZScan(key string, cursor int64, match string, count int64) *ScanCmd {
-	args := []string{"ZSCAN", key, strconv.FormatInt(cursor, 10)}
+func (c *commandable) ZScan(key string, cursor int64, match string, count int64) *ScanCmd {
+	args := []interface{}{"ZSCAN", key, cursor}
 	if match != "" {
 		args = append(args, "MATCH", match)
 	}
 	if count > 0 {
-		args = append(args, "COUNT", strconv.FormatInt(count, 10))
+		args = append(args, "COUNT", count)
 	}
 	cmd := NewScanCmd(args...)
 	c.Process(cmd)
@@ -283,7 +361,7 @@ func (c *Client) ZScan(key string, cursor int64, match string, count int64) *Sca
 
 //------------------------------------------------------------------------------
 
-func (c *Client) Append(key, value string) *IntCmd {
+func (c *commandable) Append(key, value string) *IntCmd {
 	cmd := NewIntCmd("APPEND", key, value)
 	c.Process(cmd)
 	return cmd
@@ -293,13 +371,13 @@ type BitCount struct {
 	Start, End int64
 }
 
-func (c *Client) BitCount(key string, bitCount *BitCount) *IntCmd {
-	args := []string{"BITCOUNT", key}
+func (c *commandable) BitCount(key string, bitCount *BitCount) *IntCmd {
+	args := []interface{}{"BITCOUNT", key}
 	if bitCount != nil {
 		args = append(
 			args,
-			strconv.FormatInt(bitCount.Start, 10),
-			strconv.FormatInt(bitCount.End, 10),
+			bitCount.Start,
+			bitCount.End,
 		)
 	}
 	cmd := NewIntCmd(args...)
@@ -307,157 +385,213 @@ func (c *Client) BitCount(key string, bitCount *BitCount) *IntCmd {
 	return cmd
 }
 
-func (c *Client) bitOp(op, destKey string, keys ...string) *IntCmd {
-	args := []string{"BITOP", op, destKey}
-	args = append(args, keys...)
+func (c *commandable) bitOp(op, destKey string, keys ...string) *IntCmd {
+	args := make([]interface{}, 3+len(keys))
+	args[0] = "BITOP"
+	args[1] = op
+	args[2] = destKey
+	for i, key := range keys {
+		args[3+i] = key
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) BitOpAnd(destKey string, keys ...string) *IntCmd {
+func (c *commandable) BitOpAnd(destKey string, keys ...string) *IntCmd {
 	return c.bitOp("AND", destKey, keys...)
 }
 
-func (c *Client) BitOpOr(destKey string, keys ...string) *IntCmd {
+func (c *commandable) BitOpOr(destKey string, keys ...string) *IntCmd {
 	return c.bitOp("OR", destKey, keys...)
 }
 
-func (c *Client) BitOpXor(destKey string, keys ...string) *IntCmd {
+func (c *commandable) BitOpXor(destKey string, keys ...string) *IntCmd {
 	return c.bitOp("XOR", destKey, keys...)
 }
 
-func (c *Client) BitOpNot(destKey string, key string) *IntCmd {
+func (c *commandable) BitOpNot(destKey string, key string) *IntCmd {
 	return c.bitOp("NOT", destKey, key)
 }
 
-func (c *Client) Decr(key string) *IntCmd {
+func (c *commandable) BitPos(key string, bit int64, pos ...int64) *IntCmd {
+	args := make([]interface{}, 3+len(pos))
+	args[0] = "BITPOS"
+	args[1] = key
+	args[2] = bit
+	switch len(pos) {
+	case 0:
+	case 1:
+		args[3] = pos[0]
+	case 2:
+		args[3] = pos[0]
+		args[4] = pos[1]
+	default:
+		panic("too many arguments")
+	}
+	cmd := NewIntCmd(args...)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) Decr(key string) *IntCmd {
 	cmd := NewIntCmd("DECR", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) DecrBy(key string, decrement int64) *IntCmd {
-	cmd := NewIntCmd("DECRBY", key, strconv.FormatInt(decrement, 10))
+func (c *commandable) DecrBy(key string, decrement int64) *IntCmd {
+	cmd := NewIntCmd("DECRBY", key, decrement)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Get(key string) *StringCmd {
+func (c *commandable) Get(key string) *StringCmd {
 	cmd := NewStringCmd("GET", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) GetBit(key string, offset int64) *IntCmd {
-	cmd := NewIntCmd("GETBIT", key, strconv.FormatInt(offset, 10))
+func (c *commandable) GetBit(key string, offset int64) *IntCmd {
+	cmd := NewIntCmd("GETBIT", key, offset)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) GetRange(key string, start, end int64) *StringCmd {
-	cmd := NewStringCmd(
-		"GETRANGE",
-		key,
-		strconv.FormatInt(start, 10),
-		strconv.FormatInt(end, 10),
-	)
+func (c *commandable) GetRange(key string, start, end int64) *StringCmd {
+	cmd := NewStringCmd("GETRANGE", key, start, end)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) GetSet(key, value string) *StringCmd {
+func (c *commandable) GetSet(key string, value interface{}) *StringCmd {
 	cmd := NewStringCmd("GETSET", key, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Incr(key string) *IntCmd {
+func (c *commandable) Incr(key string) *IntCmd {
 	cmd := NewIntCmd("INCR", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) IncrBy(key string, value int64) *IntCmd {
-	cmd := NewIntCmd("INCRBY", key, strconv.FormatInt(value, 10))
+func (c *commandable) IncrBy(key string, value int64) *IntCmd {
+	cmd := NewIntCmd("INCRBY", key, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) IncrByFloat(key string, value float64) *FloatCmd {
-	cmd := NewFloatCmd("INCRBYFLOAT", key, formatFloat(value))
+func (c *commandable) IncrByFloat(key string, value float64) *FloatCmd {
+	cmd := NewFloatCmd("INCRBYFLOAT", key, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) MGet(keys ...string) *SliceCmd {
-	args := append([]string{"MGET"}, keys...)
+func (c *commandable) MGet(keys ...string) *SliceCmd {
+	args := make([]interface{}, 1+len(keys))
+	args[0] = "MGET"
+	for i, key := range keys {
+		args[1+i] = key
+	}
 	cmd := NewSliceCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) MSet(pairs ...string) *StatusCmd {
-	args := append([]string{"MSET"}, pairs...)
+func (c *commandable) MSet(pairs ...string) *StatusCmd {
+	args := make([]interface{}, 1+len(pairs))
+	args[0] = "MSET"
+	for i, pair := range pairs {
+		args[1+i] = pair
+	}
 	cmd := NewStatusCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) MSetNX(pairs ...string) *BoolCmd {
-	args := append([]string{"MSETNX"}, pairs...)
+func (c *commandable) MSetNX(pairs ...string) *BoolCmd {
+	args := make([]interface{}, 1+len(pairs))
+	args[0] = "MSETNX"
+	for i, pair := range pairs {
+		args[1+i] = pair
+	}
 	cmd := NewBoolCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) PSetEx(key string, dur time.Duration, value string) *StatusCmd {
-	cmd := NewStatusCmd(
-		"PSETEX",
+// Redis `SET key value [expiration]` command.
+//
+// Zero expiration means the key has no expiration time.
+func (c *commandable) Set(key string, value interface{}, expiration time.Duration) *StatusCmd {
+	args := make([]interface{}, 3, 5)
+	args[0] = "SET"
+	args[1] = key
+	args[2] = value
+	if expiration > 0 {
+		if usePrecise(expiration) {
+			args = append(args, "PX", formatMs(expiration))
+		} else {
+			args = append(args, "EX", formatSec(expiration))
+		}
+	}
+	cmd := NewStatusCmd(args...)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) SetBit(key string, offset int64, value int) *IntCmd {
+	cmd := NewIntCmd(
+		"SETBIT",
 		key,
-		strconv.FormatInt(int64(dur/time.Millisecond), 10),
+		offset,
 		value,
 	)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) Set(key, value string) *StatusCmd {
-	cmd := NewStatusCmd("SET", key, value)
+// Redis `SET key value [expiration] NX` command.
+//
+// Zero expiration means the key has no expiration time.
+func (c *commandable) SetNX(key string, value interface{}, expiration time.Duration) *BoolCmd {
+	var cmd *BoolCmd
+	if expiration == 0 {
+		// Use old `SETNX` to support old Redis versions.
+		cmd = NewBoolCmd("SETNX", key, value)
+	} else {
+		if usePrecise(expiration) {
+			cmd = NewBoolCmd("SET", key, value, "PX", formatMs(expiration), "NX")
+		} else {
+			cmd = NewBoolCmd("SET", key, value, "EX", formatSec(expiration), "NX")
+		}
+	}
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SetBit(key string, offset int64, value int) *IntCmd {
-	cmd := NewIntCmd(
-		"SETBIT",
-		key,
-		strconv.FormatInt(offset, 10),
-		strconv.FormatInt(int64(value), 10),
-	)
+// Redis `SET key value [expiration] XX` command.
+//
+// Zero expiration means the key has no expiration time.
+func (c *Client) SetXX(key string, value interface{}, expiration time.Duration) *BoolCmd {
+	var cmd *BoolCmd
+	if usePrecise(expiration) {
+		cmd = NewBoolCmd("SET", key, value, "PX", formatMs(expiration), "XX")
+	} else {
+		cmd = NewBoolCmd("SET", key, value, "EX", formatSec(expiration), "XX")
+	}
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SetEx(key string, dur time.Duration, value string) *StatusCmd {
-	cmd := NewStatusCmd("SETEX", key, strconv.FormatInt(int64(dur/time.Second), 10), value)
+func (c *commandable) SetRange(key string, offset int64, value string) *IntCmd {
+	cmd := NewIntCmd("SETRANGE", key, offset, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SetNX(key, value string) *BoolCmd {
-	cmd := NewBoolCmd("SETNX", key, value)
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) SetRange(key string, offset int64, value string) *IntCmd {
-	cmd := NewIntCmd("SETRANGE", key, strconv.FormatInt(offset, 10), value)
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) StrLen(key string) *IntCmd {
+func (c *commandable) StrLen(key string) *IntCmd {
 	cmd := NewIntCmd("STRLEN", key)
 	c.Process(cmd)
 	return cmd
@@ -465,88 +599,105 @@ func (c *Client) StrLen(key string) *IntCmd {
 
 //------------------------------------------------------------------------------
 
-func (c *Client) HDel(key string, fields ...string) *IntCmd {
-	args := append([]string{"HDEL", key}, fields...)
+func (c *commandable) HDel(key string, fields ...string) *IntCmd {
+	args := make([]interface{}, 2+len(fields))
+	args[0] = "HDEL"
+	args[1] = key
+	for i, field := range fields {
+		args[2+i] = field
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HExists(key, field string) *BoolCmd {
+func (c *commandable) HExists(key, field string) *BoolCmd {
 	cmd := NewBoolCmd("HEXISTS", key, field)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HGet(key, field string) *StringCmd {
+func (c *commandable) HGet(key, field string) *StringCmd {
 	cmd := NewStringCmd("HGET", key, field)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HGetAll(key string) *StringSliceCmd {
+func (c *commandable) HGetAll(key string) *StringSliceCmd {
 	cmd := NewStringSliceCmd("HGETALL", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HGetAllMap(key string) *StringStringMapCmd {
+func (c *commandable) HGetAllMap(key string) *StringStringMapCmd {
 	cmd := NewStringStringMapCmd("HGETALL", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HIncrBy(key, field string, incr int64) *IntCmd {
-	cmd := NewIntCmd("HINCRBY", key, field, strconv.FormatInt(incr, 10))
+func (c *commandable) HIncrBy(key, field string, incr int64) *IntCmd {
+	cmd := NewIntCmd("HINCRBY", key, field, incr)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HIncrByFloat(key, field string, incr float64) *FloatCmd {
-	cmd := NewFloatCmd("HINCRBYFLOAT", key, field, formatFloat(incr))
+func (c *commandable) HIncrByFloat(key, field string, incr float64) *FloatCmd {
+	cmd := NewFloatCmd("HINCRBYFLOAT", key, field, incr)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HKeys(key string) *StringSliceCmd {
+func (c *commandable) HKeys(key string) *StringSliceCmd {
 	cmd := NewStringSliceCmd("HKEYS", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HLen(key string) *IntCmd {
+func (c *commandable) HLen(key string) *IntCmd {
 	cmd := NewIntCmd("HLEN", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HMGet(key string, fields ...string) *SliceCmd {
-	args := append([]string{"HMGET", key}, fields...)
+func (c *commandable) HMGet(key string, fields ...string) *SliceCmd {
+	args := make([]interface{}, 2+len(fields))
+	args[0] = "HMGET"
+	args[1] = key
+	for i, field := range fields {
+		args[2+i] = field
+	}
 	cmd := NewSliceCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HMSet(key, field, value string, pairs ...string) *StatusCmd {
-	args := append([]string{"HMSET", key, field, value}, pairs...)
+func (c *commandable) HMSet(key, field, value string, pairs ...string) *StatusCmd {
+	args := make([]interface{}, 4+len(pairs))
+	args[0] = "HMSET"
+	args[1] = key
+	args[2] = field
+	args[3] = value
+	for i, pair := range pairs {
+		args[4+i] = pair
+	}
 	cmd := NewStatusCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HSet(key, field, value string) *BoolCmd {
+func (c *commandable) HSet(key, field, value string) *BoolCmd {
 	cmd := NewBoolCmd("HSET", key, field, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HSetNX(key, field, value string) *BoolCmd {
+func (c *commandable) HSetNX(key, field, value string) *BoolCmd {
 	cmd := NewBoolCmd("HSETNX", key, field, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) HVals(key string) *StringSliceCmd {
+func (c *commandable) HVals(key string) *StringSliceCmd {
 	cmd := NewStringSliceCmd("HVALS", key)
 	c.Process(cmd)
 	return cmd
@@ -554,127 +705,145 @@ func (c *Client) HVals(key string) *StringSliceCmd {
 
 //------------------------------------------------------------------------------
 
-func (c *Client) BLPop(timeout int64, keys ...string) *StringSliceCmd {
-	args := append([]string{"BLPOP"}, keys...)
-	args = append(args, strconv.FormatInt(timeout, 10))
+func (c *commandable) BLPop(timeout time.Duration, keys ...string) *StringSliceCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "BLPOP"
+	for i, key := range keys {
+		args[1+i] = key
+	}
+	args[len(args)-1] = formatSec(timeout)
 	cmd := NewStringSliceCmd(args...)
 	cmd.setReadTimeout(readTimeout(timeout))
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) BRPop(timeout int64, keys ...string) *StringSliceCmd {
-	args := append([]string{"BRPOP"}, keys...)
-	args = append(args, strconv.FormatInt(timeout, 10))
+func (c *commandable) BRPop(timeout time.Duration, keys ...string) *StringSliceCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "BRPOP"
+	for i, key := range keys {
+		args[1+i] = key
+	}
+	args[len(args)-1] = formatSec(timeout)
 	cmd := NewStringSliceCmd(args...)
 	cmd.setReadTimeout(readTimeout(timeout))
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) BRPopLPush(source, destination string, timeout int64) *StringCmd {
+func (c *commandable) BRPopLPush(source, destination string, timeout time.Duration) *StringCmd {
 	cmd := NewStringCmd(
 		"BRPOPLPUSH",
 		source,
 		destination,
-		strconv.FormatInt(timeout, 10),
+		formatSec(timeout),
 	)
 	cmd.setReadTimeout(readTimeout(timeout))
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LIndex(key string, index int64) *StringCmd {
-	cmd := NewStringCmd("LINDEX", key, strconv.FormatInt(index, 10))
+func (c *commandable) LIndex(key string, index int64) *StringCmd {
+	cmd := NewStringCmd("LINDEX", key, index)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LInsert(key, op, pivot, value string) *IntCmd {
+func (c *commandable) LInsert(key, op, pivot, value string) *IntCmd {
 	cmd := NewIntCmd("LINSERT", key, op, pivot, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LLen(key string) *IntCmd {
+func (c *commandable) LLen(key string) *IntCmd {
 	cmd := NewIntCmd("LLEN", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LPop(key string) *StringCmd {
+func (c *commandable) LPop(key string) *StringCmd {
 	cmd := NewStringCmd("LPOP", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LPush(key string, values ...string) *IntCmd {
-	args := append([]string{"LPUSH", key}, values...)
+func (c *commandable) LPush(key string, values ...string) *IntCmd {
+	args := make([]interface{}, 2+len(values))
+	args[0] = "LPUSH"
+	args[1] = key
+	for i, value := range values {
+		args[2+i] = value
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LPushX(key, value string) *IntCmd {
+func (c *commandable) LPushX(key, value string) *IntCmd {
 	cmd := NewIntCmd("LPUSHX", key, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LRange(key string, start, stop int64) *StringSliceCmd {
+func (c *commandable) LRange(key string, start, stop int64) *StringSliceCmd {
 	cmd := NewStringSliceCmd(
 		"LRANGE",
 		key,
-		strconv.FormatInt(start, 10),
-		strconv.FormatInt(stop, 10),
+		start,
+		stop,
 	)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LRem(key string, count int64, value string) *IntCmd {
-	cmd := NewIntCmd("LREM", key, strconv.FormatInt(count, 10), value)
+func (c *commandable) LRem(key string, count int64, value string) *IntCmd {
+	cmd := NewIntCmd("LREM", key, count, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LSet(key string, index int64, value string) *StatusCmd {
-	cmd := NewStatusCmd("LSET", key, strconv.FormatInt(index, 10), value)
+func (c *commandable) LSet(key string, index int64, value string) *StatusCmd {
+	cmd := NewStatusCmd("LSET", key, index, value)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) LTrim(key string, start, stop int64) *StatusCmd {
+func (c *commandable) LTrim(key string, start, stop int64) *StatusCmd {
 	cmd := NewStatusCmd(
 		"LTRIM",
 		key,
-		strconv.FormatInt(start, 10),
-		strconv.FormatInt(stop, 10),
+		start,
+		stop,
 	)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) RPop(key string) *StringCmd {
+func (c *commandable) RPop(key string) *StringCmd {
 	cmd := NewStringCmd("RPOP", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) RPopLPush(source, destination string) *StringCmd {
+func (c *commandable) RPopLPush(source, destination string) *StringCmd {
 	cmd := NewStringCmd("RPOPLPUSH", source, destination)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) RPush(key string, values ...string) *IntCmd {
-	args := append([]string{"RPUSH", key}, values...)
+func (c *commandable) RPush(key string, values ...string) *IntCmd {
+	args := make([]interface{}, 2+len(values))
+	args[0] = "RPUSH"
+	args[1] = key
+	for i, value := range values {
+		args[2+i] = value
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) RPushX(key string, value string) *IntCmd {
+func (c *commandable) RPushX(key string, value string) *IntCmd {
 	cmd := NewIntCmd("RPUSHX", key, value)
 	c.Process(cmd)
 	return cmd
@@ -682,93 +851,138 @@ func (c *Client) RPushX(key string, value string) *IntCmd {
 
 //------------------------------------------------------------------------------
 
-func (c *Client) SAdd(key string, members ...string) *IntCmd {
-	args := append([]string{"SADD", key}, members...)
+func (c *commandable) SAdd(key string, members ...string) *IntCmd {
+	args := make([]interface{}, 2+len(members))
+	args[0] = "SADD"
+	args[1] = key
+	for i, member := range members {
+		args[2+i] = member
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SCard(key string) *IntCmd {
+func (c *commandable) SCard(key string) *IntCmd {
 	cmd := NewIntCmd("SCARD", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SDiff(keys ...string) *StringSliceCmd {
-	args := append([]string{"SDIFF"}, keys...)
+func (c *commandable) SDiff(keys ...string) *StringSliceCmd {
+	args := make([]interface{}, 1+len(keys))
+	args[0] = "SDIFF"
+	for i, key := range keys {
+		args[1+i] = key
+	}
 	cmd := NewStringSliceCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SDiffStore(destination string, keys ...string) *IntCmd {
-	args := append([]string{"SDIFFSTORE", destination}, keys...)
+func (c *commandable) SDiffStore(destination string, keys ...string) *IntCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "SDIFFSTORE"
+	args[1] = destination
+	for i, key := range keys {
+		args[2+i] = key
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SInter(keys ...string) *StringSliceCmd {
-	args := append([]string{"SINTER"}, keys...)
+func (c *commandable) SInter(keys ...string) *StringSliceCmd {
+	args := make([]interface{}, 1+len(keys))
+	args[0] = "SINTER"
+	for i, key := range keys {
+		args[1+i] = key
+	}
 	cmd := NewStringSliceCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SInterStore(destination string, keys ...string) *IntCmd {
-	args := append([]string{"SINTERSTORE", destination}, keys...)
+func (c *commandable) SInterStore(destination string, keys ...string) *IntCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "SINTERSTORE"
+	args[1] = destination
+	for i, key := range keys {
+		args[2+i] = key
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SIsMember(key, member string) *BoolCmd {
+func (c *commandable) SIsMember(key, member string) *BoolCmd {
 	cmd := NewBoolCmd("SISMEMBER", key, member)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SMembers(key string) *StringSliceCmd {
+func (c *commandable) SMembers(key string) *StringSliceCmd {
 	cmd := NewStringSliceCmd("SMEMBERS", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SMove(source, destination, member string) *BoolCmd {
+func (c *commandable) SMove(source, destination, member string) *BoolCmd {
 	cmd := NewBoolCmd("SMOVE", source, destination, member)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SPop(key string) *StringCmd {
+func (c *commandable) SPop(key string) *StringCmd {
 	cmd := NewStringCmd("SPOP", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SRandMember(key string) *StringCmd {
+// Redis `SRANDMEMBER key` command.
+func (c *commandable) SRandMember(key string) *StringCmd {
 	cmd := NewStringCmd("SRANDMEMBER", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SRem(key string, members ...string) *IntCmd {
-	args := append([]string{"SREM", key}, members...)
+// Redis `SRANDMEMBER key count` command.
+func (c *commandable) SRandMemberN(key string, count int64) *StringSliceCmd {
+	cmd := NewStringSliceCmd("SRANDMEMBER", key, count)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) SRem(key string, members ...string) *IntCmd {
+	args := make([]interface{}, 2+len(members))
+	args[0] = "SREM"
+	args[1] = key
+	for i, member := range members {
+		args[2+i] = member
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SUnion(keys ...string) *StringSliceCmd {
-	args := append([]string{"SUNION"}, keys...)
+func (c *commandable) SUnion(keys ...string) *StringSliceCmd {
+	args := make([]interface{}, 1+len(keys))
+	args[0] = "SUNION"
+	for i, key := range keys {
+		args[1+i] = key
+	}
 	cmd := NewStringSliceCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SUnionStore(destination string, keys ...string) *IntCmd {
-	args := append([]string{"SUNIONSTORE", destination}, keys...)
+func (c *commandable) SUnionStore(destination string, keys ...string) *IntCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "SUNIONSTORE"
+	args[1] = destination
+	for i, key := range keys {
+		args[2+i] = key
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
@@ -776,55 +990,145 @@ func (c *Client) SUnionStore(destination string, keys ...string) *IntCmd {
 
 //------------------------------------------------------------------------------
 
+// Sorted set member.
 type Z struct {
 	Score  float64
-	Member string
+	Member interface{}
 }
 
+// Sorted set store operation.
 type ZStore struct {
-	Weights   []int64
+	Weights []int64
+	// Can be SUM, MIN or MAX.
 	Aggregate string
 }
 
-func (c *Client) ZAdd(key string, members ...Z) *IntCmd {
-	args := []string{"ZADD", key}
-	for _, m := range members {
-		args = append(args, formatFloat(m.Score), m.Member)
+func (c *commandable) zAdd(a []interface{}, n int, members ...Z) *IntCmd {
+	for i, m := range members {
+		a[n+2*i] = m.Score
+		a[n+2*i+1] = m.Member
 	}
-	cmd := NewIntCmd(args...)
+	cmd := NewIntCmd(a...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZCard(key string) *IntCmd {
+// Redis `ZADD key score member [score member ...]` command.
+func (c *commandable) ZAdd(key string, members ...Z) *IntCmd {
+	const n = 2
+	a := make([]interface{}, n+2*len(members))
+	a[0], a[1] = "ZADD", key
+	return c.zAdd(a, n, members...)
+}
+
+// Redis `ZADD key NX score member [score member ...]` command.
+func (c *commandable) ZAddNX(key string, members ...Z) *IntCmd {
+	const n = 3
+	a := make([]interface{}, n+2*len(members))
+	a[0], a[1], a[2] = "ZADD", key, "NX"
+	return c.zAdd(a, n, members...)
+}
+
+// Redis `ZADD key XX score member [score member ...]` command.
+func (c *commandable) ZAddXX(key string, members ...Z) *IntCmd {
+	const n = 3
+	a := make([]interface{}, n+2*len(members))
+	a[0], a[1], a[2] = "ZADD", key, "XX"
+	return c.zAdd(a, n, members...)
+}
+
+// Redis `ZADD key CH score member [score member ...]` command.
+func (c *commandable) ZAddCh(key string, members ...Z) *IntCmd {
+	const n = 3
+	a := make([]interface{}, n+2*len(members))
+	a[0], a[1], a[2] = "ZADD", key, "CH"
+	return c.zAdd(a, n, members...)
+}
+
+// Redis `ZADD key NX CH score member [score member ...]` command.
+func (c *commandable) ZAddNXCh(key string, members ...Z) *IntCmd {
+	const n = 4
+	a := make([]interface{}, n+2*len(members))
+	a[0], a[1], a[2], a[3] = "ZADD", key, "NX", "CH"
+	return c.zAdd(a, n, members...)
+}
+
+// Redis `ZADD key XX CH score member [score member ...]` command.
+func (c *commandable) ZAddXXCh(key string, members ...Z) *IntCmd {
+	const n = 4
+	a := make([]interface{}, n+2*len(members))
+	a[0], a[1], a[2], a[3] = "ZADD", key, "XX", "CH"
+	return c.zAdd(a, n, members...)
+}
+
+func (c *commandable) zIncr(a []interface{}, n int, members ...Z) *FloatCmd {
+	for i, m := range members {
+		a[n+2*i] = m.Score
+		a[n+2*i+1] = m.Member
+	}
+	cmd := NewFloatCmd(a...)
+	c.Process(cmd)
+	return cmd
+}
+
+// Redis `ZADD key INCR score member` command.
+func (c *commandable) ZIncr(key string, member Z) *FloatCmd {
+	const n = 3
+	a := make([]interface{}, n+2)
+	a[0], a[1], a[2] = "ZADD", key, "INCR"
+	return c.zIncr(a, n, member)
+}
+
+// Redis `ZADD key NX INCR score member` command.
+func (c *commandable) ZIncrNX(key string, member Z) *FloatCmd {
+	const n = 4
+	a := make([]interface{}, n+2)
+	a[0], a[1], a[2], a[3] = "ZADD", key, "INCR", "NX"
+	return c.zIncr(a, n, member)
+}
+
+// Redis `ZADD key XX INCR score member` command.
+func (c *commandable) ZIncrXX(key string, member Z) *FloatCmd {
+	const n = 4
+	a := make([]interface{}, n+2)
+	a[0], a[1], a[2], a[3] = "ZADD", key, "INCR", "XX"
+	return c.zIncr(a, n, member)
+}
+
+func (c *commandable) ZCard(key string) *IntCmd {
 	cmd := NewIntCmd("ZCARD", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZCount(key, min, max string) *IntCmd {
+func (c *commandable) ZCount(key, min, max string) *IntCmd {
 	cmd := NewIntCmd("ZCOUNT", key, min, max)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZIncrBy(key string, increment float64, member string) *FloatCmd {
-	cmd := NewFloatCmd("ZINCRBY", key, formatFloat(increment), member)
+func (c *commandable) ZIncrBy(key string, increment float64, member string) *FloatCmd {
+	cmd := NewFloatCmd("ZINCRBY", key, increment, member)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZInterStore(
+func (c *commandable) ZInterStore(
 	destination string,
 	store ZStore,
 	keys ...string,
 ) *IntCmd {
-	args := []string{"ZINTERSTORE", destination, strconv.FormatInt(int64(len(keys)), 10)}
-	args = append(args, keys...)
+	args := make([]interface{}, 3+len(keys))
+	args[0] = "ZINTERSTORE"
+	args[1] = destination
+	args[2] = strconv.Itoa(len(keys))
+	for i, key := range keys {
+		args[3+i] = key
+	}
 	if len(store.Weights) > 0 {
 		args = append(args, "WEIGHTS")
 		for _, weight := range store.Weights {
-			args = append(args, strconv.FormatInt(weight, 10))
+			args = append(args, weight)
 		}
 	}
 	if store.Aggregate != "" {
@@ -835,12 +1139,12 @@ func (c *Client) ZInterStore(
 	return cmd
 }
 
-func (c *Client) zRange(key string, start, stop int64, withScores bool) *StringSliceCmd {
-	args := []string{
+func (c *commandable) zRange(key string, start, stop int64, withScores bool) *StringSliceCmd {
+	args := []interface{}{
 		"ZRANGE",
 		key,
-		strconv.FormatInt(start, 10),
-		strconv.FormatInt(stop, 10),
+		start,
+		stop,
 	}
 	if withScores {
 		args = append(args, "WITHSCORES")
@@ -850,31 +1154,24 @@ func (c *Client) zRange(key string, start, stop int64, withScores bool) *StringS
 	return cmd
 }
 
-func (c *Client) ZRange(key string, start, stop int64) *StringSliceCmd {
+func (c *commandable) ZRange(key string, start, stop int64) *StringSliceCmd {
 	return c.zRange(key, start, stop, false)
 }
 
-func (c *Client) ZRangeWithScores(key string, start, stop int64) *ZSliceCmd {
-	args := []string{
-		"ZRANGE",
-		key,
-		strconv.FormatInt(start, 10),
-		strconv.FormatInt(stop, 10),
-		"WITHSCORES",
-	}
-	cmd := NewZSliceCmd(args...)
+func (c *commandable) ZRangeWithScores(key string, start, stop int64) *ZSliceCmd {
+	cmd := NewZSliceCmd("ZRANGE", key, start, stop, "WITHSCORES")
 	c.Process(cmd)
 	return cmd
 }
 
+// TODO: Rename to something more generic in v4
 type ZRangeByScore struct {
-	Min, Max string
-
+	Min, Max      string
 	Offset, Count int64
 }
 
-func (c *Client) zRangeByScore(key string, opt ZRangeByScore, withScores bool) *StringSliceCmd {
-	args := []string{"ZRANGEBYSCORE", key, opt.Min, opt.Max}
+func (c *commandable) zRangeBy(zcmd, key string, opt ZRangeByScore, withScores bool) *StringSliceCmd {
+	args := []interface{}{zcmd, key, opt.Min, opt.Max}
 	if withScores {
 		args = append(args, "WITHSCORES")
 	}
@@ -882,8 +1179,8 @@ func (c *Client) zRangeByScore(key string, opt ZRangeByScore, withScores bool) *
 		args = append(
 			args,
 			"LIMIT",
-			strconv.FormatInt(opt.Offset, 10),
-			strconv.FormatInt(opt.Count, 10),
+			opt.Offset,
+			opt.Count,
 		)
 	}
 	cmd := NewStringSliceCmd(args...)
@@ -891,18 +1188,22 @@ func (c *Client) zRangeByScore(key string, opt ZRangeByScore, withScores bool) *
 	return cmd
 }
 
-func (c *Client) ZRangeByScore(key string, opt ZRangeByScore) *StringSliceCmd {
-	return c.zRangeByScore(key, opt, false)
+func (c *commandable) ZRangeByScore(key string, opt ZRangeByScore) *StringSliceCmd {
+	return c.zRangeBy("ZRANGEBYSCORE", key, opt, false)
 }
 
-func (c *Client) ZRangeByScoreWithScores(key string, opt ZRangeByScore) *ZSliceCmd {
-	args := []string{"ZRANGEBYSCORE", key, opt.Min, opt.Max, "WITHSCORES"}
+func (c *commandable) ZRangeByLex(key string, opt ZRangeByScore) *StringSliceCmd {
+	return c.zRangeBy("ZRANGEBYLEX", key, opt, false)
+}
+
+func (c *commandable) ZRangeByScoreWithScores(key string, opt ZRangeByScore) *ZSliceCmd {
+	args := []interface{}{"ZRANGEBYSCORE", key, opt.Min, opt.Max, "WITHSCORES"}
 	if opt.Offset != 0 || opt.Count != 0 {
 		args = append(
 			args,
 			"LIMIT",
-			strconv.FormatInt(opt.Offset, 10),
-			strconv.FormatInt(opt.Count, 10),
+			opt.Offset,
+			opt.Count,
 		)
 	}
 	cmd := NewZSliceCmd(args...)
@@ -910,68 +1211,61 @@ func (c *Client) ZRangeByScoreWithScores(key string, opt ZRangeByScore) *ZSliceC
 	return cmd
 }
 
-func (c *Client) ZRank(key, member string) *IntCmd {
+func (c *commandable) ZRank(key, member string) *IntCmd {
 	cmd := NewIntCmd("ZRANK", key, member)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZRem(key string, members ...string) *IntCmd {
-	args := append([]string{"ZREM", key}, members...)
+func (c *commandable) ZRem(key string, members ...string) *IntCmd {
+	args := make([]interface{}, 2+len(members))
+	args[0] = "ZREM"
+	args[1] = key
+	for i, member := range members {
+		args[2+i] = member
+	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZRemRangeByRank(key string, start, stop int64) *IntCmd {
+func (c *commandable) ZRemRangeByRank(key string, start, stop int64) *IntCmd {
 	cmd := NewIntCmd(
 		"ZREMRANGEBYRANK",
 		key,
-		strconv.FormatInt(start, 10),
-		strconv.FormatInt(stop, 10),
+		start,
+		stop,
 	)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZRemRangeByScore(key, min, max string) *IntCmd {
+func (c *commandable) ZRemRangeByScore(key, min, max string) *IntCmd {
 	cmd := NewIntCmd("ZREMRANGEBYSCORE", key, min, max)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) zRevRange(key, start, stop string, withScores bool) *StringSliceCmd {
-	args := []string{"ZREVRANGE", key, start, stop}
-	if withScores {
-		args = append(args, "WITHSCORES")
-	}
-	cmd := NewStringSliceCmd(args...)
+func (c *commandable) ZRevRange(key string, start, stop int64) *StringSliceCmd {
+	cmd := NewStringSliceCmd("ZREVRANGE", key, start, stop)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZRevRange(key, start, stop string) *StringSliceCmd {
-	return c.zRevRange(key, start, stop, false)
-}
-
-func (c *Client) ZRevRangeWithScores(key, start, stop string) *ZSliceCmd {
-	args := []string{"ZREVRANGE", key, start, stop, "WITHSCORES"}
-	cmd := NewZSliceCmd(args...)
+func (c *commandable) ZRevRangeWithScores(key string, start, stop int64) *ZSliceCmd {
+	cmd := NewZSliceCmd("ZREVRANGE", key, start, stop, "WITHSCORES")
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) zRevRangeByScore(key string, opt ZRangeByScore, withScores bool) *StringSliceCmd {
-	args := []string{"ZREVRANGEBYSCORE", key, opt.Max, opt.Min}
-	if withScores {
-		args = append(args, "WITHSCORES")
-	}
+func (c *commandable) zRevRangeBy(zcmd, key string, opt ZRangeByScore) *StringSliceCmd {
+	args := []interface{}{zcmd, key, opt.Max, opt.Min}
 	if opt.Offset != 0 || opt.Count != 0 {
 		args = append(
 			args,
 			"LIMIT",
-			strconv.FormatInt(opt.Offset, 10),
-			strconv.FormatInt(opt.Count, 10),
+			opt.Offset,
+			opt.Count,
 		)
 	}
 	cmd := NewStringSliceCmd(args...)
@@ -979,18 +1273,22 @@ func (c *Client) zRevRangeByScore(key string, opt ZRangeByScore, withScores bool
 	return cmd
 }
 
-func (c *Client) ZRevRangeByScore(key string, opt ZRangeByScore) *StringSliceCmd {
-	return c.zRevRangeByScore(key, opt, false)
+func (c *commandable) ZRevRangeByScore(key string, opt ZRangeByScore) *StringSliceCmd {
+	return c.zRevRangeBy("ZREVRANGEBYSCORE", key, opt)
 }
 
-func (c *Client) ZRevRangeByScoreWithScores(key string, opt ZRangeByScore) *ZSliceCmd {
-	args := []string{"ZREVRANGEBYSCORE", key, opt.Max, opt.Min, "WITHSCORES"}
+func (c commandable) ZRevRangeByLex(key string, opt ZRangeByScore) *StringSliceCmd {
+	return c.zRevRangeBy("ZREVRANGEBYLEX", key, opt)
+}
+
+func (c *commandable) ZRevRangeByScoreWithScores(key string, opt ZRangeByScore) *ZSliceCmd {
+	args := []interface{}{"ZREVRANGEBYSCORE", key, opt.Max, opt.Min, "WITHSCORES"}
 	if opt.Offset != 0 || opt.Count != 0 {
 		args = append(
 			args,
 			"LIMIT",
-			strconv.FormatInt(opt.Offset, 10),
-			strconv.FormatInt(opt.Count, 10),
+			opt.Offset,
+			opt.Count,
 		)
 	}
 	cmd := NewZSliceCmd(args...)
@@ -998,29 +1296,30 @@ func (c *Client) ZRevRangeByScoreWithScores(key string, opt ZRangeByScore) *ZSli
 	return cmd
 }
 
-func (c *Client) ZRevRank(key, member string) *IntCmd {
+func (c *commandable) ZRevRank(key, member string) *IntCmd {
 	cmd := NewIntCmd("ZREVRANK", key, member)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZScore(key, member string) *FloatCmd {
+func (c *commandable) ZScore(key, member string) *FloatCmd {
 	cmd := NewFloatCmd("ZSCORE", key, member)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ZUnionStore(
-	destination string,
-	store ZStore,
-	keys ...string,
-) *IntCmd {
-	args := []string{"ZUNIONSTORE", destination, strconv.FormatInt(int64(len(keys)), 10)}
-	args = append(args, keys...)
+func (c *commandable) ZUnionStore(dest string, store ZStore, keys ...string) *IntCmd {
+	args := make([]interface{}, 3+len(keys))
+	args[0] = "ZUNIONSTORE"
+	args[1] = dest
+	args[2] = strconv.Itoa(len(keys))
+	for i, key := range keys {
+		args[3+i] = key
+	}
 	if len(store.Weights) > 0 {
 		args = append(args, "WEIGHTS")
 		for _, weight := range store.Weights {
-			args = append(args, strconv.FormatInt(weight, 10))
+			args = append(args, weight)
 		}
 	}
 	if store.Aggregate != "" {
@@ -1033,178 +1332,425 @@ func (c *Client) ZUnionStore(
 
 //------------------------------------------------------------------------------
 
-func (c *Client) BgRewriteAOF() *StatusCmd {
-	cmd := NewStatusCmd("BGREWRITEAOF")
+func (c *commandable) PFAdd(key string, fields ...string) *IntCmd {
+	args := make([]interface{}, 2+len(fields))
+	args[0] = "PFADD"
+	args[1] = key
+	for i, field := range fields {
+		args[2+i] = field
+	}
+	cmd := NewIntCmd(args...)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) BgSave() *StatusCmd {
-	cmd := NewStatusCmd("BGSAVE")
+func (c *commandable) PFCount(key string) *IntCmd {
+	cmd := NewIntCmd("PFCOUNT", key)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ClientKill(ipPort string) *StatusCmd {
-	cmd := NewStatusCmd("CLIENT", "KILL", ipPort)
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) ClientList() *StringCmd {
-	cmd := NewStringCmd("CLIENT", "LIST")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) ConfigGet(parameter string) *SliceCmd {
-	cmd := NewSliceCmd("CONFIG", "GET", parameter)
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) ConfigResetStat() *StatusCmd {
-	cmd := NewStatusCmd("CONFIG", "RESETSTAT")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) ConfigSet(parameter, value string) *StatusCmd {
-	cmd := NewStatusCmd("CONFIG", "SET", parameter, value)
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) DbSize() *IntCmd {
-	cmd := NewIntCmd("DBSIZE")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) FlushAll() *StatusCmd {
-	cmd := NewStatusCmd("FLUSHALL")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) FlushDb() *StatusCmd {
-	cmd := NewStatusCmd("FLUSHDB")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) Info() *StringCmd {
-	cmd := NewStringCmd("INFO")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) LastSave() *IntCmd {
-	cmd := NewIntCmd("LASTSAVE")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) Save() *StatusCmd {
-	cmd := NewStatusCmd("SAVE")
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *Client) shutdown(modifier string) *StatusCmd {
-	var args []string
-	if modifier == "" {
-		args = []string{"SHUTDOWN"}
-	} else {
-		args = []string{"SHUTDOWN", modifier}
+func (c *commandable) PFMerge(dest string, keys ...string) *StatusCmd {
+	args := make([]interface{}, 2+len(keys))
+	args[0] = "PFMERGE"
+	args[1] = dest
+	for i, key := range keys {
+		args[2+i] = key
 	}
 	cmd := NewStatusCmd(args...)
 	c.Process(cmd)
-	c.Close()
 	return cmd
 }
 
-func (c *Client) Shutdown() *StatusCmd {
+//------------------------------------------------------------------------------
+
+func (c *commandable) BgRewriteAOF() *StatusCmd {
+	cmd := NewStatusCmd("BGREWRITEAOF")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) BgSave() *StatusCmd {
+	cmd := NewStatusCmd("BGSAVE")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClientKill(ipPort string) *StatusCmd {
+	cmd := NewStatusCmd("CLIENT", "KILL", ipPort)
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClientList() *StringCmd {
+	cmd := NewStringCmd("CLIENT", "LIST")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClientPause(dur time.Duration) *BoolCmd {
+	cmd := NewBoolCmd("CLIENT", "PAUSE", formatMs(dur))
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+// ClientSetName assigns a name to the one of many connections in the pool.
+func (c *commandable) ClientSetName(name string) *BoolCmd {
+	cmd := NewBoolCmd("CLIENT", "SETNAME", name)
+	c.Process(cmd)
+	return cmd
+}
+
+// ClientGetName returns the name of the one of many connections in the pool.
+func (c *Client) ClientGetName() *StringCmd {
+	cmd := NewStringCmd("CLIENT", "GETNAME")
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ConfigGet(parameter string) *SliceCmd {
+	cmd := NewSliceCmd("CONFIG", "GET", parameter)
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ConfigResetStat() *StatusCmd {
+	cmd := NewStatusCmd("CONFIG", "RESETSTAT")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ConfigSet(parameter, value string) *StatusCmd {
+	cmd := NewStatusCmd("CONFIG", "SET", parameter, value)
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) DbSize() *IntCmd {
+	cmd := NewIntCmd("DBSIZE")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) FlushAll() *StatusCmd {
+	cmd := newKeylessStatusCmd("FLUSHALL")
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) FlushDb() *StatusCmd {
+	cmd := newKeylessStatusCmd("FLUSHDB")
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) Info() *StringCmd {
+	cmd := NewStringCmd("INFO")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) LastSave() *IntCmd {
+	cmd := NewIntCmd("LASTSAVE")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) Save() *StatusCmd {
+	cmd := newKeylessStatusCmd("SAVE")
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) shutdown(modifier string) *StatusCmd {
+	var args []interface{}
+	if modifier == "" {
+		args = []interface{}{"SHUTDOWN"}
+	} else {
+		args = []interface{}{"SHUTDOWN", modifier}
+	}
+	cmd := newKeylessStatusCmd(args...)
+	c.Process(cmd)
+	if err := cmd.Err(); err != nil {
+		if err == io.EOF {
+			// Server quit as expected.
+			cmd.err = nil
+		}
+	} else {
+		// Server did not quit. String reply contains the reason.
+		cmd.err = errorf(cmd.val)
+		cmd.val = ""
+	}
+	return cmd
+}
+
+func (c *commandable) Shutdown() *StatusCmd {
 	return c.shutdown("")
 }
 
-func (c *Client) ShutdownSave() *StatusCmd {
+func (c *commandable) ShutdownSave() *StatusCmd {
 	return c.shutdown("SAVE")
 }
 
-func (c *Client) ShutdownNoSave() *StatusCmd {
+func (c *commandable) ShutdownNoSave() *StatusCmd {
 	return c.shutdown("NOSAVE")
 }
 
-func (c *Client) SlaveOf(host, port string) *StatusCmd {
-	cmd := NewStatusCmd("SLAVEOF", host, port)
+func (c *commandable) SlaveOf(host, port string) *StatusCmd {
+	cmd := newKeylessStatusCmd("SLAVEOF", host, port)
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) SlowLog() {
+func (c *commandable) SlowLog() {
 	panic("not implemented")
 }
 
-func (c *Client) Sync() {
+func (c *commandable) Sync() {
 	panic("not implemented")
 }
 
-func (c *Client) Time() *StringSliceCmd {
+func (c *commandable) Time() *StringSliceCmd {
 	cmd := NewStringSliceCmd("TIME")
+	cmd._clusterKeyPos = 0
 	c.Process(cmd)
 	return cmd
 }
 
 //------------------------------------------------------------------------------
 
-func (c *Client) Eval(script string, keys []string, args []string) *Cmd {
-	cmdArgs := []string{"EVAL", script, strconv.FormatInt(int64(len(keys)), 10)}
-	cmdArgs = append(cmdArgs, keys...)
-	cmdArgs = append(cmdArgs, args...)
+func (c *commandable) Eval(script string, keys []string, args []string) *Cmd {
+	cmdArgs := make([]interface{}, 3+len(keys)+len(args))
+	cmdArgs[0] = "EVAL"
+	cmdArgs[1] = script
+	cmdArgs[2] = strconv.Itoa(len(keys))
+	for i, key := range keys {
+		cmdArgs[3+i] = key
+	}
+	pos := 3 + len(keys)
+	for i, arg := range args {
+		cmdArgs[pos+i] = arg
+	}
 	cmd := NewCmd(cmdArgs...)
+	if len(keys) > 0 {
+		cmd._clusterKeyPos = 3
+	}
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) EvalSha(sha1 string, keys []string, args []string) *Cmd {
-	cmdArgs := []string{"EVALSHA", sha1, strconv.FormatInt(int64(len(keys)), 10)}
-	cmdArgs = append(cmdArgs, keys...)
-	cmdArgs = append(cmdArgs, args...)
+func (c *commandable) EvalSha(sha1 string, keys []string, args []string) *Cmd {
+	cmdArgs := make([]interface{}, 3+len(keys)+len(args))
+	cmdArgs[0] = "EVALSHA"
+	cmdArgs[1] = sha1
+	cmdArgs[2] = strconv.Itoa(len(keys))
+	for i, key := range keys {
+		cmdArgs[3+i] = key
+	}
+	pos := 3 + len(keys)
+	for i, arg := range args {
+		cmdArgs[pos+i] = arg
+	}
 	cmd := NewCmd(cmdArgs...)
+	if len(keys) > 0 {
+		cmd._clusterKeyPos = 3
+	}
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ScriptExists(scripts ...string) *BoolSliceCmd {
-	args := append([]string{"SCRIPT", "EXISTS"}, scripts...)
+func (c *commandable) ScriptExists(scripts ...string) *BoolSliceCmd {
+	args := make([]interface{}, 2+len(scripts))
+	args[0] = "SCRIPT"
+	args[1] = "EXISTS"
+	for i, script := range scripts {
+		args[2+i] = script
+	}
 	cmd := NewBoolSliceCmd(args...)
+	cmd._clusterKeyPos = 0
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ScriptFlush() *StatusCmd {
-	cmd := NewStatusCmd("SCRIPT", "FLUSH")
+func (c *commandable) ScriptFlush() *StatusCmd {
+	cmd := newKeylessStatusCmd("SCRIPT", "FLUSH")
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ScriptKill() *StatusCmd {
-	cmd := NewStatusCmd("SCRIPT", "KILL")
+func (c *commandable) ScriptKill() *StatusCmd {
+	cmd := newKeylessStatusCmd("SCRIPT", "KILL")
 	c.Process(cmd)
 	return cmd
 }
 
-func (c *Client) ScriptLoad(script string) *StringCmd {
+func (c *commandable) ScriptLoad(script string) *StringCmd {
 	cmd := NewStringCmd("SCRIPT", "LOAD", script)
+	cmd._clusterKeyPos = 0
 	c.Process(cmd)
 	return cmd
 }
 
 //------------------------------------------------------------------------------
 
-func (c *Client) DebugObject(key string) *StringCmd {
+func (c *commandable) DebugObject(key string) *StringCmd {
 	cmd := NewStringCmd("DEBUG", "OBJECT", key)
+	cmd._clusterKeyPos = 2
+	c.Process(cmd)
+	return cmd
+}
+
+//------------------------------------------------------------------------------
+
+func (c *commandable) PubSubChannels(pattern string) *StringSliceCmd {
+	args := []interface{}{"PUBSUB", "CHANNELS"}
+	if pattern != "*" {
+		args = append(args, pattern)
+	}
+	cmd := NewStringSliceCmd(args...)
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) PubSubNumSub(channels ...string) *StringIntMapCmd {
+	args := make([]interface{}, 2+len(channels))
+	args[0] = "PUBSUB"
+	args[1] = "NUMSUB"
+	for i, channel := range channels {
+		args[2+i] = channel
+	}
+	cmd := NewStringIntMapCmd(args...)
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) PubSubNumPat() *IntCmd {
+	cmd := NewIntCmd("PUBSUB", "NUMPAT")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+//------------------------------------------------------------------------------
+
+func (c *commandable) ClusterSlots() *ClusterSlotCmd {
+	cmd := NewClusterSlotCmd("CLUSTER", "slots")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClusterNodes() *StringCmd {
+	cmd := NewStringCmd("CLUSTER", "nodes")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClusterMeet(host, port string) *StatusCmd {
+	cmd := newKeylessStatusCmd("CLUSTER", "meet", host, port)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClusterReplicate(nodeID string) *StatusCmd {
+	cmd := newKeylessStatusCmd("CLUSTER", "replicate", nodeID)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClusterInfo() *StringCmd {
+	cmd := NewStringCmd("CLUSTER", "info")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClusterFailover() *StatusCmd {
+	cmd := newKeylessStatusCmd("CLUSTER", "failover")
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClusterAddSlots(slots ...int) *StatusCmd {
+	args := make([]interface{}, 2+len(slots))
+	args[0] = "CLUSTER"
+	args[1] = "ADDSLOTS"
+	for i, num := range slots {
+		args[2+i] = strconv.Itoa(num)
+	}
+	cmd := newKeylessStatusCmd(args...)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClusterAddSlotsRange(min, max int) *StatusCmd {
+	size := max - min + 1
+	slots := make([]int, size)
+	for i := 0; i < size; i++ {
+		slots[i] = min + i
+	}
+	return c.ClusterAddSlots(slots...)
+}
+
+//------------------------------------------------------------------------------
+
+func (c *commandable) GeoAdd(key string, geoLocation ...*GeoLocation) *IntCmd {
+	args := make([]interface{}, 2+3*len(geoLocation))
+	args[0] = "GEOADD"
+	args[1] = key
+	for i, eachLoc := range geoLocation {
+		args[2+3*i] = eachLoc.Longitude
+		args[2+3*i+1] = eachLoc.Latitude
+		args[2+3*i+2] = eachLoc.Name
+	}
+	cmd := NewIntCmd(args...)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) GeoRadius(key string, longitude, latitude float64, query *GeoRadiusQuery) *GeoLocationCmd {
+	cmd := NewGeoLocationCmd(query, "GEORADIUS", key, longitude, latitude)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) GeoRadiusByMember(key, member string, query *GeoRadiusQuery) *GeoLocationCmd {
+	cmd := NewGeoLocationCmd(query, "GEORADIUSBYMEMBER", key, member)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) GeoDist(key string, member1, member2, unit string) *FloatCmd {
+	if unit == "" {
+		unit = "km"
+	}
+	cmd := NewFloatCmd("GEODIST", key, member1, member2, unit)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) GeoHash(key string, members ...string) *StringSliceCmd {
+	args := make([]interface{}, 2+len(members))
+	args[0] = "GEOHASH"
+	args[1] = key
+	for i, member := range members {
+		args[2+i] = member
+	}
+	cmd := NewStringSliceCmd(args...)
 	c.Process(cmd)
 	return cmd
 }

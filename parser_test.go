@@ -1,9 +1,9 @@
 package redis
 
 import (
+	"bufio"
+	"bytes"
 	"testing"
-
-	"gopkg.in/bufio.v1"
 )
 
 func BenchmarkParseReplyStatus(b *testing.B) {
@@ -23,31 +23,32 @@ func BenchmarkParseReplyString(b *testing.B) {
 }
 
 func BenchmarkParseReplySlice(b *testing.B) {
-	benchmarkParseReply(b, "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n", parseSlice, false)
+	benchmarkParseReply(b, "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n", sliceParser, false)
 }
 
 func benchmarkParseReply(b *testing.B, reply string, p multiBulkParser, wanterr bool) {
-	b.StopTimer()
-
-	buf := &bufio.Buffer{}
-	rd := bufio.NewReader(buf)
+	buf := &bytes.Buffer{}
 	for i := 0; i < b.N; i++ {
 		buf.WriteString(reply)
 	}
+	cn := &conn{
+		rd:  bufio.NewReader(buf),
+		buf: make([]byte, 0, defaultBufSize),
+	}
 
-	b.StartTimer()
+	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_, err := parseReply(rd, p)
+		_, err := readReply(cn, p)
 		if !wanterr && err != nil {
-			panic(err)
+			b.Fatal(err)
 		}
 	}
 }
 
 func BenchmarkAppendArgs(b *testing.B) {
 	buf := make([]byte, 0, 64)
-	args := []string{"hello", "world", "foo", "bar"}
+	args := []interface{}{"hello", "world", "foo", "bar"}
 	for i := 0; i < b.N; i++ {
 		appendArgs(buf, args)
 	}
