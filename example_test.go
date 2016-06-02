@@ -6,14 +6,19 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/redis.v3"
+	"github.com/linkedin-inc/redis"
 )
 
 var client *redis.Client
 
 func init() {
 	client = redis.NewClient(&redis.Options{
-		Addr: ":6379",
+		Addr:         ":6379",
+		DialTimeout:  10 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		PoolSize:     10,
+		PoolTimeout:  30 * time.Second,
 	})
 	client.FlushDb()
 }
@@ -107,6 +112,21 @@ func ExampleClient_Incr() {
 	n, err := client.Get("counter").Int64()
 	fmt.Println(n, err)
 	// Output: 1 <nil>
+}
+
+func ExampleClient_BLPop() {
+	if err := client.RPush("queue", "message").Err(); err != nil {
+		panic(err)
+	}
+
+	// use `client.BLPop(0, "queue")` for infinite waiting time
+	result, err := client.BLPop(1*time.Second, "queue").Result()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(result[0], result[1])
+	// Output: queue message
 }
 
 func ExampleClient_Scan() {
@@ -205,13 +225,13 @@ func ExampleClient_Watch() {
 }
 
 func ExamplePubSub() {
-	pubsub, err := client.Subscribe("mychannel")
+	pubsub, err := client.Subscribe("mychannel1")
 	if err != nil {
 		panic(err)
 	}
 	defer pubsub.Close()
 
-	err = client.Publish("mychannel", "hello").Err()
+	err = client.Publish("mychannel1", "hello").Err()
 	if err != nil {
 		panic(err)
 	}
@@ -222,39 +242,42 @@ func ExamplePubSub() {
 	}
 
 	fmt.Println(msg.Channel, msg.Payload)
-	// Output: mychannel hello
+	// Output: mychannel1 hello
 }
 
 func ExamplePubSub_Receive() {
-	pubsub, err := client.Subscribe("mychannel")
+	pubsub, err := client.Subscribe("mychannel2")
 	if err != nil {
 		panic(err)
 	}
 	defer pubsub.Close()
 
-	err = client.Publish("mychannel", "hello").Err()
+	n, err := client.Publish("mychannel2", "hello").Result()
 	if err != nil {
 		panic(err)
 	}
+	fmt.Println(n, "clients received message")
 
 	for i := 0; i < 2; i++ {
-		msgi, err := pubsub.ReceiveTimeout(100 * time.Millisecond)
+		// ReceiveTimeout is a low level API. Use ReceiveMessage instead.
+		msgi, err := pubsub.ReceiveTimeout(5 * time.Second)
 		if err != nil {
-			panic(err)
+			break
 		}
 
 		switch msg := msgi.(type) {
 		case *redis.Subscription:
-			fmt.Println(msg.Kind, msg.Channel)
+			fmt.Println("subscribed to", msg.Channel)
 		case *redis.Message:
-			fmt.Println(msg.Channel, msg.Payload)
+			fmt.Println("received", msg.Payload, "from", msg.Channel)
 		default:
-			panic(fmt.Sprintf("unknown message: %#v", msgi))
+			panic(fmt.Errorf("unknown message: %#v", msgi))
 		}
 	}
 
-	// Output: subscribe mychannel
-	// mychannel hello
+	// Output: 1 clients received message
+	// subscribed to mychannel2
+	// received hello from mychannel2
 }
 
 func ExampleScript() {

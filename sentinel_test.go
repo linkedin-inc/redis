@@ -1,10 +1,9 @@
 package redis_test
 
 import (
+	"github.com/linkedin-inc/redis"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	"gopkg.in/redis.v3"
 )
 
 var _ = Describe("Sentinel", func() {
@@ -15,6 +14,7 @@ var _ = Describe("Sentinel", func() {
 			MasterName:    sentinelName,
 			SentinelAddrs: []string{":" + sentinelPort},
 		})
+		Expect(client.FlushDb().Err()).NotTo(HaveOccurred())
 	})
 
 	AfterEach(func() {

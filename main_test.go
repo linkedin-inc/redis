@@ -1,19 +1,19 @@
 package redis_test
 
 import (
+	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/linkedin-inc/redis"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	"gopkg.in/redis.v3"
 )
 
 const (
@@ -93,21 +93,57 @@ var _ = AfterSuite(func() {
 
 func TestGinkgoSuite(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "gopkg.in/redis.v3")
+	RunSpecs(t, "github.com/linkedin-inc/redis")
 }
 
 //------------------------------------------------------------------------------
 
-func eventually(fn func() error, timeout time.Duration) (err error) {
-	done := make(chan struct{})
+func redisOptions() *redis.Options {
+	return &redis.Options{
+		Addr:               redisAddr,
+		DB:                 15,
+		DialTimeout:        10 * time.Second,
+		ReadTimeout:        30 * time.Second,
+		WriteTimeout:       30 * time.Second,
+		PoolSize:           10,
+		PoolTimeout:        30 * time.Second,
+		IdleTimeout:        time.Second,
+		IdleCheckFrequency: time.Second,
+	}
+}
+
+func perform(n int, cbs ...func(int)) {
+	var wg sync.WaitGroup
+	for _, cb := range cbs {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(cb func(int), i int) {
+				defer GinkgoRecover()
+				defer wg.Done()
+
+				cb(i)
+			}(cb, i)
+		}
+	}
+	wg.Wait()
+}
+
+func eventually(fn func() error, timeout time.Duration) error {
 	var exit int32
+	var retErr error
+	var mu sync.Mutex
+	done := make(chan struct{})
+
 	go func() {
 		for atomic.LoadInt32(&exit) == 0 {
-			err = fn()
+			err := fn()
 			if err == nil {
 				close(done)
 				return
 			}
+			mu.Lock()
+			retErr = err
+			mu.Unlock()
 			time.Sleep(timeout / 100)
 		}
 	}()
@@ -117,6 +153,9 @@ func eventually(fn func() error, timeout time.Duration) (err error) {
 		return nil
 	case <-time.After(timeout):
 		atomic.StoreInt32(&exit, 1)
+		mu.Lock()
+		err := retErr
+		mu.Unlock()
 		return err
 	}
 }
@@ -130,20 +169,19 @@ func execCmd(name string, args ...string) (*os.Process, error) {
 	return cmd.Process, cmd.Start()
 }
 
-func connectTo(port string) (client *redis.Client, err error) {
-	client = redis.NewClient(&redis.Options{
+func connectTo(port string) (*redis.Client, error) {
+	client := redis.NewClient(&redis.Options{
 		Addr: ":" + port,
 	})
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if err = client.Ping().Err(); err == nil {
-			return client, nil
-		}
-		time.Sleep(250 * time.Millisecond)
+	err := eventually(func() error {
+		return client.Ping().Err()
+	}, 30*time.Second)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, err
+	return client, nil
 }
 
 type redisProcess struct {
@@ -152,22 +190,38 @@ type redisProcess struct {
 }
 
 func (p *redisProcess) Close() error {
+	if err := p.Kill(); err != nil {
+		return err
+	}
+
+	err := eventually(func() error {
+		if err := p.Client.Ping().Err(); err != nil {
+			return nil
+		}
+		return errors.New("client is not shutdown")
+	}, 10*time.Second)
+	if err != nil {
+		return err
+	}
+
 	p.Client.Close()
-	return p.Kill()
+	return nil
 }
 
 var (
-	redisServerBin, _  = filepath.Abs(filepath.Join(".test", "redis", "src", "redis-server"))
-	redisServerConf, _ = filepath.Abs(filepath.Join(".test", "redis.conf"))
+	redisServerBin, _  = filepath.Abs(filepath.Join("testdata", "redis", "src", "redis-server"))
+	redisServerConf, _ = filepath.Abs(filepath.Join("testdata", "redis.conf"))
 )
 
 func redisDir(port string) (string, error) {
-	dir, err := filepath.Abs(filepath.Join(".test", "instances", port))
+	dir, err := filepath.Abs(filepath.Join("testdata", "instances", port))
 	if err != nil {
 		return "", err
-	} else if err = os.RemoveAll(dir); err != nil {
+	}
+	if err := os.RemoveAll(dir); err != nil {
 		return "", err
-	} else if err = os.MkdirAll(dir, 0775); err != nil {
+	}
+	if err := os.MkdirAll(dir, 0775); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -226,10 +280,6 @@ func startSentinel(port, masterName, masterPort string) (*redisProcess, error) {
 }
 
 //------------------------------------------------------------------------------
-
-var (
-	errTimeout = syscall.ETIMEDOUT
-)
 
 type badConnError string
 
