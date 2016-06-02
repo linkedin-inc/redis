@@ -67,12 +67,21 @@ func isMovedError(err error) (moved bool, ask bool, addr string) {
 		return
 	}
 
-	ind := strings.LastIndexByte(s, ' ')
+	ind := LastIndexByte(s, ' ')
 	if ind == -1 {
 		return false, false, ""
 	}
 	addr = s[ind+1:]
 	return
+}
+
+func LastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // shouldRetry reports whether failed command should be retried.
